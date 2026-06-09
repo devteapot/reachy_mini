@@ -1,0 +1,4 @@
+.slop/
+.sloppy/session-server.log
+.sloppy/sessions/
+Library/

@@ -53,6 +53,12 @@ class FakeMini:
     def goto_sleep(self):
         self.calls.append(("goto_sleep",))
 
+    def play_move(self, move, initial_goto_duration=0.0, sound=True):
+        self.calls.append(
+            ("play_move", getattr(move, "description", ""), initial_goto_duration, sound)
+        )
+        self._head[1] = round(self._head[1] + 0.2, 4)
+
     def enable_wobbling(self):
         self.calls.append(("enable_wobbling",))
 

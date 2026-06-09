@@ -24,11 +24,16 @@ sloppy (TS SLOP consumer)
 /reachy
 ├── /status     props: connected, mode, head_joints, antenna_joints   (live, ~5 Hz)
 ├── /head       actions: goto_pose(pitch,roll,yaw,z,duration), set_antennas(right,left)
-└── /behavior   actions: wake_up, goto_sleep, enable_wobbling, disable_wobbling
+└── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
+                enable_wobbling, disable_wobbling
 ```
 
 - `goto_pose` — head orientation in **degrees**, height `z` in **mm**, `duration` in seconds.
 - `set_antennas` — `right`/`left` angles in **radians**.
+- `list_emotions` / `play_emotion(name)` — default recorded emotions from
+  `pollen-robotics/reachy-mini-emotions-library`. The first call may cache the
+  dataset from Hugging Face. Motion plays without bundled sounds while this
+  provider runs with `media_backend="no_media"`.
 
 ## Setup
 
@@ -45,18 +50,21 @@ uv pip install -e "/Users/carlid/dev/reachy_mini[mujoco]"
 uv pip install "slop-ai>=0.2"
 ```
 
-## Run & verify (3 terminals)
+## Demo: GUI sim + isolated sloppy (3 terminals)
 
-**1 — Simulator daemon (visible MuJoCo window).** On macOS the MuJoCo GUI requires
-`mjpython` rather than the `reachy-mini-daemon` console script:
+Two helper scripts wrap the fiddly bits (macOS `mjpython` + config isolation).
+
+**1 — Simulator daemon with the visible MuJoCo window:**
 
 ```bash
-mjpython -m reachy_mini.daemon.app.main --sim
-# Linux: reachy-mini-daemon --sim
-# add --scene minimal for a table + objects
+./run_sim_gui.sh                 # add --scene minimal for a table + objects
 ```
 
-**2 — The SLOP provider:**
+On macOS the MuJoCo viewer must run under `mjpython`; with a uv-managed Python it
+also needs `DYLD_FALLBACK_LIBRARY_PATH` pointed at the interpreter's lib dir — the
+script sets that for you. (Headless equivalent: `reachy-mini-daemon --sim --headless`.)
+
+**2 — The SLOP provider** (connects to the daemon, serves the SLOP surface):
 
 ```bash
 python reachy_slop_provider.py
@@ -64,14 +72,68 @@ python reachy_slop_provider.py
 # and listens on /tmp/slop/reachy.sock
 ```
 
-**3 — sloppy:** start the agent normally. `/tmp/slop/providers` is a default discovery
-path, so the `reachy` provider auto-loads (no config change). Then:
+**3 — sloppy, with the minimal demo config** (isolated from your global `~/.sloppy`):
 
-- **State check** — have the agent `query_state` / `focus_state` on `/reachy`; the
-  `status` node should show live `head_joints`. This proves the SLOP handshake
-  (hello → subscribe → snapshot → patch) works end to end.
-- **Control check** — ask: *"look up and to the left, then wobble the antennas."* The
-  head and antennas should move in the MuJoCo window. Try `wake_up` / `goto_sleep` too.
+```bash
+./run_sloppy_demo.sh             # session runtime + WebSocket + attached TUI
+```
+
+`run_sloppy_demo.sh` starts one `sloppy session serve` runtime with `HOME` pointed
+at `./demo`, exposes that same runtime at `ws://127.0.0.1:8787/slop`, then attaches
+the TUI to the WebSocket. It loads `./demo/.sloppy/config.yaml` and ignores your
+global instance. It sets `SLOPPY_CODEX_AUTH_PATH` so your `codex login` still works
+under the HOME override.
+
+Set `SLOPPY_DIR` if your sloppy checkout isn't at `~/dev/sloppy`. The launcher uses
+`src/bin/sloppy.ts` when present so local runtime changes are picked up without a
+rebuild; set `SLOPPY_ENTRYPOINT=~/dev/sloppy/dist/bin/sloppy.js` to force the built
+entrypoint.
+
+WebSocket overrides:
+
+```bash
+SLOPPY_WS_PORT=8788 ./run_sloppy_demo.sh
+SLOPPY_WS_ALLOW_ORIGINS=http://localhost:5173,http://127.0.0.1:5173 ./run_sloppy_demo.sh
+SLOPPY_WS_TOKEN=... SLOPPY_WS_HOST=0.0.0.0 ./run_sloppy_demo.sh
+```
+
+To access the runtime from another PC on the same LAN, run the launcher on the
+robot/laptop machine with LAN mode:
+
+```bash
+SLOPPY_WS_LAN=1 ./run_sloppy_demo.sh
+```
+
+LAN mode binds the WebSocket listener to `0.0.0.0`, auto-detects the LAN IP for
+the advertised URL, and auto-generates a temporary token if `SLOPPY_WS_TOKEN` is
+not already set. Use the printed `websocket connect url` from the other PC. If
+auto-detection picks the wrong interface, override it:
+
+```bash
+SLOPPY_WS_LAN=1 SLOPPY_WS_PUBLIC_HOST=192.168.1.42 ./run_sloppy_demo.sh
+```
+
+Prompt mode (`-p` / `--prompt`) is intentionally disabled in this launcher; enter
+prompts in the attached TUI so the TUI and web clients share the same runtime.
+
+### Connecting the robot (manual, by design)
+
+External providers are **not** auto-connected. The discovered robot shows up in the
+`apps` surface as an available, unloaded app; the agent connects it via the
+`apps` `load_provider` affordance. So a good first prompt is:
+
+> *"Load the Reachy Mini app, then make it look up and to the left and wobble its antennas."*
+
+The agent will `apps → load_provider(reachy)`, after which the `/reachy` affordances
+(`goto_pose`, `set_antennas`, `wake_up`, `goto_sleep`, wobbling) become available.
+
+- **State check** — once loaded, `query_state` / `focus_state` on `/reachy` shows live
+  `head_joints` (proves the SLOP handshake: hello → subscribe → snapshot → patch).
+- **Control check** — the head and antennas move in the MuJoCo window. Try
+  `wake_up` / `goto_sleep` too.
+- **Emotion check** — ask: "Load the Reachy Mini app, list the default emotions,
+  then play a small happy/default emotion." The agent should call
+  `behavior.list_emotions` before `behavior.play_emotion(name)`.
 
 `Ctrl-C` the provider to clean up the socket and descriptor.
 

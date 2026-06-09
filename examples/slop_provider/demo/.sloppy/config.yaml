@@ -1,0 +1,118 @@
+# Sloppy config for the Reachy Mini VOICE demo (Phase 2).
+#
+# Loaded in isolation from your global ~/.sloppy config by running sloppy with
+# HOME pointed at this `demo/` directory (see run_sloppy_demo.sh). Your global
+# config is untouched.
+#
+# Pipeline (all local except the Voxtral TTS, which the voice gateway fronts on
+# localhost so it counts as local to the voice policy):
+#   mic (sox) → voice /stt → Parakeet (voice_gateway :8090)
+#            → agent turn → Qwen3-4B via mlx-lm (:8080)
+#            → voice /tts → Voxtral on the spark (via voice_gateway :8090 proxy)
+#            → afplay  + runtime-driven head motion on the simulated Reachy.
+
+# LLM: OpenAI Codex (gpt-5.4-mini) — faster than the local mlx model. Uses your
+# Codex login (run_sloppy_demo.sh sets SLOPPY_CODEX_AUTH_PATH to ~/.codex/auth.json
+# despite the HOME override). gpt-5.4-mini isn't in sloppy's built-in catalog, so
+# the endpoint is defined here with the codex-compatible model metadata.
+llm:
+  defaultProfileId: codex-mini
+  endpoints:
+    codex:
+      label: OpenAI Codex
+      protocol: openai-codex
+      baseUrl: https://chatgpt.com/backend-api/codex
+      auth:
+        type: codex
+      models:
+        gpt-5.4-mini:
+          label: Codex gpt-5.4-mini
+          contextWindowTokens: 258400
+          maxOutputTokens: 64000
+          capabilities:
+            tools: true
+            images: true
+          compat:
+            kind: openai
+            maxTokensField: max_completion_tokens
+            thinkingFormat: openai
+  profiles:
+    - kind: native
+      id: codex-mini
+      label: Codex gpt-5.4-mini
+      endpointId: codex
+      model: gpt-5.4-mini
+
+# Auto-discover the Reachy SLOP provider from its descriptor.
+providers:
+  discovery:
+    enabled: true
+    paths:
+      - /tmp/slop/providers
+
+plugins:
+  # apps → the provider-management surface. The discovered `reachy` provider shows
+  # up here; the agent loads it via apps' load_provider affordance (external
+  # providers are not auto-connected). Once loaded, head-motion affordances are live.
+  apps:
+    enabled: true
+  terminal:
+    enabled: false
+  filesystem:
+    enabled: false
+
+  # Voice provider: STT + TTS as SLOP affordances. Both endpoints point at the
+  # local voice gateway (run_voice_gateway.sh) on :8090 with auth: none, so the
+  # voice network policy auto-allows them (no per-turn approval prompts).
+  voice:
+    enabled: true
+    stt:
+      endpoints:
+        parakeet:
+          protocol: openai-transcriptions
+          baseUrl: http://localhost:8090/v1
+          auth:
+            type: none
+          models:
+            parakeet-tdt: {}
+      profiles:
+        - id: stt-parakeet
+          label: Parakeet TDT (mlx)
+          endpointId: parakeet
+          model: parakeet-tdt
+          language: en
+      defaultProfileId: stt-parakeet
+    tts:
+      endpoints:
+        voxtral:
+          protocol: openai-speech
+          baseUrl: http://localhost:8090/v1 # gateway proxies /audio/speech to the spark
+          auth:
+            type: none
+          model: mistralai/Voxtral-4B-TTS-2603
+      profiles:
+        - id: tts-voxtral
+          label: Voxtral (spark)
+          endpointId: voxtral
+          model: mistralai/Voxtral-4B-TTS-2603
+          voice: casual_female
+          format: wav # wav so afplay can decode it (raw pcm has no container)
+          autospeak: false # the conversation loop synthesizes replies itself
+      defaultProfileId: tts-voxtral
+
+  # The hands-free conversation loop. host backend = laptop mic/speaker now;
+  # embodiment drives runtime head/antenna motion on the (loaded) reachy provider.
+  voice-conversation:
+    enabled: true
+    audio:
+      backend: host
+      silenceStopSeconds: 1.2
+      maxUtteranceSeconds: 30
+      providerId: reachy
+    embodiment:
+      enabled: true
+      providerId: reachy
+
+session:
+  persistSnapshots: true
+  persistenceDir: .sloppy/sessions

@@ -16,8 +16,9 @@ State tree::
 
     /reachy
     ├── /status     props: connected, mode, head_joints, antenna_joints  (live, polled)
-    ├── /head       actions: goto_pose, set_antennas
-    └── /behavior   actions: wake_up, goto_sleep, enable_wobbling, disable_wobbling
+    ├── /head       actions: goto_pose, set_pose, set_antennas
+    └── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
+                    enable_wobbling, disable_wobbling
 
 Run::
 
@@ -34,10 +35,12 @@ import json
 import logging
 import os
 import signal
+import threading
 from pathlib import Path
 from typing import Any
 
 from reachy_mini import ReachyMini
+from reachy_mini.motion.recorded_move import RecordedMoves
 from reachy_mini.utils import create_head_pose
 from slop_ai import SlopServer
 from slop_ai.transports.unix import listen as listen_unix
@@ -47,8 +50,28 @@ logger = logging.getLogger("reachy-slop")
 
 DEFAULT_SOCKET = "/tmp/slop/reachy.sock"
 DEFAULT_DESCRIPTOR = "/tmp/slop/providers/reachy.json"
+DEFAULT_EMOTIONS_DATASET = "pollen-robotics/reachy-mini-emotions-library"
 POLL_INTERVAL_S = 0.2  # ~5 Hz state poll
 JOINT_ROUNDING = 4  # decimals — stabilises float jitter so we don't emit constant patches
+
+
+class RecordedMoveLibrary:
+    """Lazy loader for a Hugging Face recorded-move dataset."""
+
+    def __init__(self, dataset_name: str) -> None:
+        self.dataset_name = dataset_name
+        self._moves: RecordedMoves | None = None
+        self._lock = threading.Lock()
+
+    def load(self) -> RecordedMoves:
+        with self._lock:
+            if self._moves is None:
+                logger.info("loading recorded moves dataset: %s", self.dataset_name)
+                self._moves = RecordedMoves(self.dataset_name)
+            return self._moves
+
+    def list_moves(self) -> list[str]:
+        return sorted(self.load().list_moves())
 
 
 class RobotState:
@@ -74,6 +97,7 @@ class RobotState:
 def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
     """Construct the SLOP server: nodes read the cache, actions drive the robot."""
     slop = SlopServer("reachy", "Reachy Mini")
+    emotions = RecordedMoveLibrary(DEFAULT_EMOTIONS_DATASET)
 
     # --- Nodes (read cache only) ------------------------------------------------
 
@@ -109,8 +133,9 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         return {
             "type": "control",
             "summary": (
-                "High-level behaviors: wake_up and goto_sleep emotes, and audio-reactive "
-                "head wobbling (visible motion only when audio is playing)."
+                "High-level behaviors: wake_up and goto_sleep emotes, default recorded "
+                "emotion moves, and audio-reactive head wobbling (visible motion only "
+                "when audio is playing)."
             ),
         }
 
@@ -144,6 +169,31 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
 
     @slop.action(
         "head",
+        "set_pose",
+        params={
+            "pitch": {"type": "number", "description": "Head pitch in degrees (+ looks up)."},
+            "roll": {"type": "number", "description": "Head roll in degrees (+ tilts right)."},
+            "yaw": {"type": "number", "description": "Head yaw in degrees (+ turns left)."},
+            "z": {"type": "number", "description": "Head vertical offset in millimetres."},
+        },
+        label="Set head pose",
+        description=(
+            "Set the head orientation (degrees) and height (mm) immediately, without "
+            "interpolation. Fast and non-blocking — intended for real-time animation "
+            "(e.g. talking motion) at ~10 Hz, unlike goto_pose which interpolates."
+        ),
+        estimate="fast",
+    )
+    async def set_pose(pitch: float, roll: float, yaw: float, z: float) -> dict[str, Any]:
+        pose = create_head_pose(z=z, roll=roll, pitch=pitch, yaw=yaw, mm=True, degrees=True)
+        await asyncio.to_thread(mini.set_target, head=pose)
+        state.last_pose = {"pitch": pitch, "roll": roll, "yaw": yaw, "z": z}
+        # No slop.refresh() here: set_pose is called at high frequency during
+        # animation; the background poll reflects the resulting joint motion.
+        return {"ok": True, "pose": state.last_pose}
+
+    @slop.action(
+        "head",
         "set_antennas",
         params={
             "right": {"type": "number", "description": "Right antenna angle in radians."},
@@ -169,6 +219,57 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         await asyncio.to_thread(mini.goto_sleep)
         slop.refresh()
         return {"ok": True}
+
+    @slop.action(
+        "behavior",
+        "list_emotions",
+        label="List emotions",
+        description=(
+            "List recorded emotion move names from the default Reachy Mini emotions "
+            "library. The first call may download/cache the dataset."
+        ),
+        estimate="slow",
+    )
+    async def list_emotions() -> dict[str, Any]:
+        moves = await asyncio.to_thread(emotions.list_moves)
+        return {"ok": True, "dataset": emotions.dataset_name, "emotions": moves}
+
+    @slop.action(
+        "behavior",
+        "play_emotion",
+        params={
+            "name": {
+                "type": "string",
+                "description": "Emotion move name returned by list_emotions.",
+            },
+        },
+        label="Play emotion",
+        description=(
+            "Play one recorded move from the default Reachy Mini emotions library. "
+            "The robot first moves to the recording's initial pose over 1 second."
+        ),
+        estimate="slow",
+    )
+    async def play_emotion(name: str) -> dict[str, Any]:
+        def _play() -> list[str]:
+            library = emotions.load()
+            available = sorted(library.list_moves())
+            if name not in available:
+                raise ValueError(
+                    f"Unknown emotion {name!r}. Available emotions: {', '.join(available)}"
+                )
+            move = library.get(name)
+            mini.play_move(move, initial_goto_duration=1.0, sound=False)
+            return available
+
+        available = await asyncio.to_thread(_play)
+        slop.refresh()
+        return {
+            "ok": True,
+            "emotion": name,
+            "dataset": emotions.dataset_name,
+            "available_emotions": available,
+        }
 
     @slop.action("behavior", "enable_wobbling", label="Enable wobbling", estimate="instant")
     async def enable_wobbling() -> dict[str, Any]:
