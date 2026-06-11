@@ -645,7 +645,13 @@ def write_descriptor(path: str, socket_path: str) -> None:
     logger.info("wrote discovery descriptor: %s", path)
 
 
-async def run(socket_path: str, descriptor_path: str, media_backend: str) -> None:
+async def run(
+    socket_path: str,
+    descriptor_path: str,
+    media_backend: str,
+    wake_on_start: bool = True,
+    sleep_on_exit: bool = True,
+) -> None:
     logger.info("connecting to Reachy Mini daemon (media_backend=%s)...", media_backend)
     try:
         mini = ReachyMini(media_backend=media_backend)
@@ -668,6 +674,17 @@ async def run(socket_path: str, descriptor_path: str, media_backend: str) -> Non
     logger.info("mode=%s audio=%s volume=%s", state.mode, state.audio, state.volume)
     slop = build_server(mini, state)
 
+    if wake_on_start:
+        # The provider performs the wake-up (not the daemon) so the emote sound
+        # plays through our working audio path — the daemon's media server needs
+        # the GStreamer Rust webrtc plugin for its sounds. run_robot_usb.sh
+        # starts the daemon with --no-wake-up-on-start accordingly.
+        logger.info("waking up the robot...")
+        try:
+            await asyncio.to_thread(mini.wake_up)
+        except Exception:
+            logger.warning("wake-up on start failed", exc_info=True)
+
     server = await listen_unix(slop, socket_path)
     write_descriptor(descriptor_path, socket_path)
     logger.info("SLOP provider listening on unix:%s (mode=%s)", socket_path, state.mode)
@@ -687,6 +704,13 @@ async def run(socket_path: str, descriptor_path: str, media_backend: str) -> Non
         await stop.wait()
     finally:
         logger.info("shutting down...")
+        if sleep_on_exit:
+            # Sleep with sound while our audio path is still open; the daemon's
+            # own goto-sleep-on-stop stays enabled as a (silent) safety net.
+            try:
+                await asyncio.to_thread(mini.goto_sleep)
+            except Exception:
+                logger.warning("goto-sleep on exit failed", exc_info=True)
         poll_task.cancel()
         try:
             await poll_task
@@ -721,8 +745,28 @@ def main() -> None:
             "falls back to 'no_media' if it can't initialise."
         ),
     )
+    parser.add_argument(
+        "--wake-on-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Wake the robot (with sound) when the provider starts.",
+    )
+    parser.add_argument(
+        "--sleep-on-exit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Put the robot to sleep (with sound) when the provider shuts down.",
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.socket, args.descriptor, args.media_backend))
+    asyncio.run(
+        run(
+            args.socket,
+            args.descriptor,
+            args.media_backend,
+            wake_on_start=args.wake_on_start,
+            sleep_on_exit=args.sleep_on_exit,
+        )
+    )
 
 
 if __name__ == "__main__":

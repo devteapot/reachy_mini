@@ -90,9 +90,12 @@ again on Ctrl-C:
 ```
 
 If a daemon is already running on `:8000` it is reused (and left running on
-exit). The daemon wakes the robot on start by default; pass
-`--no-wake-up-on-start` to keep it asleep until the agent invokes `wake_up`.
-`/status.mode` will report `real`. Then start sloppy as in step 3 below.
+exit). The **provider** wakes the robot on start and puts it to sleep on Ctrl-C —
+with their emote sounds, through its own audio path (the daemon's sounds need the
+GStreamer Rust webrtc plugin, so the launcher starts the daemon with
+`--no-wake-up-on-start`). Use the provider's `--no-wake-on-start` /
+`--no-sleep-on-exit` flags to opt out. `/status.mode` will report `real`.
+Then start sloppy as in step 3 below.
 
 ## Demo: GUI sim + isolated sloppy (3 terminals)
 

@@ -60,8 +60,11 @@ trap cleanup EXIT
 if daemon_up; then
   echo "[run_robot_usb] daemon already running on :8000 — reusing it (will not stop it on exit)"
 else
+  # --no-wake-up-on-start: the SLOP provider performs the wake-up instead, so
+  # the emote sound plays (the daemon's sounds need the GStreamer Rust webrtc
+  # plugin). Extra "$@" args come after and can override.
   echo "[run_robot_usb] starting reachy-mini-daemon (USB, serial auto-detect); log: $DAEMON_LOG"
-  reachy-mini-daemon "$@" > "$DAEMON_LOG" 2>&1 &
+  reachy-mini-daemon --no-wake-up-on-start "$@" > "$DAEMON_LOG" 2>&1 &
   DAEMON_PID=$!
 
   # Wait for the REST API to come up (motor init + USB detection take a moment).
