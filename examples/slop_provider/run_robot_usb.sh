@@ -14,6 +14,11 @@ cd "$(dirname "$0")"
 if [[ -f .venv/bin/activate ]]; then
   # shellcheck disable=SC1091
   source .venv/bin/activate
+  if ! command -v reachy-mini-daemon > /dev/null 2>&1; then
+    echo "[run_robot_usb] .venv exists but the Reachy SDK is not installed in it." >&2
+    echo "[run_robot_usb] Run:  source .venv/bin/activate && uv pip install -e ../.. && uv pip install 'slop-ai>=0.2'" >&2
+    exit 1
+  fi
 elif command -v reachy-mini-daemon > /dev/null 2>&1; then
   echo "[run_robot_usb] no .venv here — using reachy-mini-daemon from PATH"
 else
