@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import math
+import time
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -39,7 +40,9 @@ class FakeMini:
 
     def goto_target(self, head=None, duration=0.5, **kw):
         self.calls.append(("goto_target", duration))
-        # Pretend the move landed: nudge joint 1 so the consumer sees a patch.
+        # Hold for the requested duration (runs in to_thread) so the provider's
+        # busy window is observable, then pretend the move landed.
+        time.sleep(min(float(duration), 2.0))
         self._head[1] = round(self._head[1] + 0.1, 4)
 
     def set_target(self, antennas=None, **kw):
@@ -58,6 +61,18 @@ class FakeMini:
             ("play_move", getattr(move, "description", ""), initial_goto_duration, sound)
         )
         self._head[1] = round(self._head[1] + 0.2, 4)
+
+    async def async_play_move(
+        self, move, play_frequency=100.0, initial_goto_duration=0.0, sound=True
+    ):
+        self.calls.append(
+            ("async_play_move", getattr(move, "description", ""), initial_goto_duration, sound)
+        )
+        await asyncio.sleep(0.2)
+        self._head[1] = round(self._head[1] + 0.2, 4)
+
+    def cancel_move(self):
+        self.calls.append(("cancel_move",))
 
     def enable_wobbling(self):
         self.calls.append(("enable_wobbling",))

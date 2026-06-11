@@ -1,8 +1,0 @@
-{
-  "id": "reachy",
-  "name": "Reachy Mini",
-  "transport": {
-    "type": "unix",
-    "path": "/tmp/slop/reachy.sock"
-  }
-}

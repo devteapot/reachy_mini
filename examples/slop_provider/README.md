@@ -1,6 +1,6 @@
 # Reachy Mini → SLOP provider
 
-A small [SLOP](https://github.com/agnt-gg/slop) provider that wraps the Reachy Mini
+A small [SLOP](https://github.com/devteapot/slop) provider that wraps the Reachy Mini
 Python SDK and exposes the robot as a **state tree + affordances** over a Unix socket.
 A SLOP consumer — e.g. the [`sloppy`](https://github.com/devteapot/sloppy) agent runtime —
 connects, observes joint state, and invokes movement/behavior actions. No bespoke tool
@@ -22,18 +22,30 @@ sloppy (TS SLOP consumer)
 
 ```
 /reachy
-├── /status     props: connected, mode, head_joints, antenna_joints   (live, ~5 Hz)
-├── /head       actions: goto_pose(pitch,roll,yaw,z,duration), set_antennas(right,left)
+├── /status     props: connected, mode, busy, current_action,
+│               head_joints, antenna_joints                            (live, ~5 Hz)
+├── /head       actions: goto_pose(pitch,roll,yaw,z,duration),
+│               set_pose(pitch,roll,yaw,z), set_antennas(right,left)
 └── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
-                enable_wobbling, disable_wobbling
+                enable_wobbling, disable_wobbling, stop (visible while busy)
 ```
 
-- `goto_pose` — head orientation in **degrees**, height `z` in **mm**, `duration` in seconds.
+- `goto_pose` — head orientation in **degrees** (+pitch looks **down**, +roll tilts
+  right, +yaw turns left), height `z` in **mm**, `duration` in seconds.
+- `set_pose` — same units, immediate (no interpolation); for ~10 Hz animation.
 - `set_antennas` — `right`/`left` angles in **radians**.
 - `list_emotions` / `play_emotion(name)` — default recorded emotions from
   `pollen-robotics/reachy-mini-emotions-library`. The first call may cache the
   dataset from Hugging Face. Motion plays without bundled sounds while this
   provider runs with `media_backend="no_media"`.
+
+**Async motion + busy state.** Long motions (`goto_pose`, `wake_up`, `goto_sleep`,
+`play_emotion`) follow the SLOP async-actions extension: the invoke returns
+`status: "accepted"` immediately and the motion runs in the background, so the
+connection stays responsive. `/status` shows `busy` + `current_action`; completion
+is signalled by a patch (busy → false) and an `action-finished` event. While busy,
+`/behavior` swaps its motion affordances for `stop` (cancels a playing recorded
+move), and conflicting motion invokes fail with `error.code: "conflict"`.
 
 ## Setup
 
@@ -144,5 +156,8 @@ The agent will `apps → load_provider(reachy)`, after which the `/reachy` affor
   their sound effects are silently skipped without audio.
 - Every SDK call is blocking, so actions run it via `asyncio.to_thread` and a background
   task polls joint state into a cache — node functions never call the SDK directly.
-- `goto_pose` returns only after the interpolated motion completes (it's marked
-  `estimate: "slow"`).
+- The discovery descriptor is written per the spec's hardening rules: `0700`
+  providers dir, `0600` file, atomic temp-file + rename, and a `pid` field so
+  consumers can detect a stale descriptor after a crash.
+- `mode` in `/status` is read from `GET /api/daemon/status` at startup
+  (`sim` / `real` / `unknown`).

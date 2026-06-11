@@ -69,6 +69,10 @@ and exit.
 - TTS must be `format: wav` (afplay needs a container; raw pcm won't play).
 - `voice.tts … autospeak: false` — the loop synthesizes replies itself; autospeak
   would double the TTS call.
+- Long motions (`goto_pose`, `play_emotion`, …) now return `accepted` and run in
+  the background; while one plays, `head.set_pose` returns a `conflict` error, so
+  talking animation pauses during emotions and resumes after the `action-finished`
+  event.
 - Override hosts/ports: gateway flags `--port` / `--tts-upstream`; LLM model via
   the `llm` block in `demo/.sloppy/config.yaml`.
 ```
