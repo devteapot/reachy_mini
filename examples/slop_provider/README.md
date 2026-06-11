@@ -23,13 +23,15 @@ sloppy (TS SLOP consumer)
 ```
 /reachy
 ├── /status     props: connected, mode, audio, busy, current_action,
+│               power_state, listen_mode, wake_word_active, audio_gate_open,
 │               head_joints, antenna_joints                            (live, ~5 Hz)
 ├── /head       actions: goto_pose(pitch,roll,yaw,z,duration),
 │               set_pose(pitch,roll,yaw,z), set_antennas(right,left)
 ├── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
 │               enable_wobbling, disable_wobbling, stop (visible while busy)
 └── /audio      props: available, volume, microphone_volume           (polled ~5 s)
-                actions: set_volume(volume), set_microphone_volume(volume), test_sound
+                actions: set_volume(volume), set_microphone_volume(volume),
+                test_sound, set_listen_mode(mode)
 ```
 
 - `goto_pose` — head orientation in **degrees** (+pitch looks **down**, +roll tilts
@@ -53,6 +55,28 @@ is signalled by a patch (busy → false) and an `action-finished` event. While b
 `/behavior` swaps its motion affordances for `stop` (cancels a playing recorded
 move), and conflicting motion invokes fail with `error.code: "conflict"`.
 
+**Sleep/wake + microphone routing.** The provider owns the robot microphone via
+an audio router (`audio_router.py`) and serves a gated mono PCM16 stream on a
+Unix socket (`--audio-socket`, default `/tmp/slop/reachy_audio.sock`); sloppy's
+voice plugin reads it through `audio_stream_client.py` as its `streamCommand`.
+`power_state` + `listen_mode` decide what flows:
+
+| state | motors | mic stream | wake word |
+|---|---|---|---|
+| `live` + `listen_mode: realtime` | on | everything | off |
+| `live` + `listen_mode: wake` (default) | on | after the wake word, until end of speech | armed |
+| `sleep` (after `goto_sleep`) | off | silence only | armed |
+
+While gated, silence frames substitute 1:1 for real ones, so the consumer sees
+an uninterrupted stream and no real audio leaves the provider. Saying the wake
+word while asleep wakes the robot (motors + emote) and streams the speech right
+after the wake word as the first utterance — *"hey jarvis, what time is it"*
+works in one breath (a short pre-roll covers the detection lag). While asleep,
+motion affordances are hidden/rejected and `/behavior` offers `wake_up`.
+Detection runs locally via [openWakeWord](https://github.com/dscripka/openWakeWord)
+(`--wake-model`, default `hey_jarvis`; pass a path to a custom `.onnx` for your
+own phrase). Events: `wake-word-detected`, `power-state-changed`.
+
 ## Setup
 
 Python ≥ 3.10. Using [`uv`](https://docs.astral.sh/uv/):
@@ -74,6 +98,10 @@ uv pip install -e ../..
 
 # SLOP SDK from PyPI (0.2 line — matches sloppy's @slop-ai/* 0.2.0)
 uv pip install "slop-ai>=0.2"
+
+# wake-word detection (optional — without it, wake-by-voice is disabled and
+# everything else still works; first run downloads the model)
+uv pip install "openwakeword>=0.6" onnxruntime
 ```
 
 If GStreamer audio can't initialise at provider startup, it falls back to

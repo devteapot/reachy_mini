@@ -19,6 +19,11 @@ if [[ -f .venv/bin/activate ]]; then
     echo "[run_robot_usb] Run:  source .venv/bin/activate && uv pip install -e ../.. && uv pip install 'slop-ai>=0.2'" >&2
     exit 1
   fi
+  if ! python -c 'import openwakeword' > /dev/null 2>&1; then
+    # Soft check: the provider degrades to affordance-only wake without it.
+    echo "[run_robot_usb] note: openwakeword not installed — wake-by-voice disabled." >&2
+    echo "[run_robot_usb]       uv pip install 'openwakeword>=0.6' onnxruntime" >&2
+  fi
 elif command -v reachy-mini-daemon > /dev/null 2>&1; then
   echo "[run_robot_usb] no .venv here — using reachy-mini-daemon from PATH"
 else

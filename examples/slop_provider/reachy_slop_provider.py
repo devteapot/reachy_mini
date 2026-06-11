@@ -20,12 +20,25 @@ State tree::
 
     /reachy
     ├── /status     props: connected, mode, audio, busy, current_action,
+    │               power_state, listen_mode, wake_word_active, audio_gate_open,
     │               head_joints, antenna_joints  (live, polled)
     ├── /head       actions: goto_pose, set_pose, set_antennas
     ├── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
     │               enable_wobbling, disable_wobbling, stop (visible while busy)
     └── /audio      props: available, volume, microphone_volume  (polled ~5 s)
-                    actions: set_volume, set_microphone_volume, test_sound
+                    actions: set_volume, set_microphone_volume, test_sound,
+                    set_listen_mode
+
+Power states (see ``audio_router.py`` for the microphone side):
+
+- ``live`` + listen_mode ``realtime``: open mic — every frame streams to the
+  consumer's voice pipeline.
+- ``live`` + listen_mode ``wake``: the mic stream stays silent until the wake
+  word is heard, then flows until end of speech.
+- ``sleep`` (after goto_sleep): motors off, mic stream silent, wake word armed.
+  Saying the wake word (or invoking wake_up) brings the robot back to live;
+  a voice wake forwards the speech right after the wake word as the first
+  utterance and lands in listen_mode ``wake``.
 
 Long-running motion (goto_pose, wake_up, goto_sleep, play_emotion) is async per
 the SLOP async-actions extension: the invoke returns ``status: "accepted"``
@@ -59,6 +72,15 @@ from reachy_mini.motion.recorded_move import RecordedMoves
 from reachy_mini.utils import create_head_pose
 from slop_ai import SlopServer
 from slop_ai.transports.unix import listen as listen_unix
+
+from audio_router import (
+    DEFAULT_SOCKET as DEFAULT_AUDIO_SOCKET,
+    DEFAULT_WAKE_MODEL,
+    AudioRouter,
+    AudioRouterConfig,
+    RouterMode,
+    WakeEvent,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("reachy-slop")
@@ -129,6 +151,10 @@ class RobotState:
         self.mode: str = "unknown"  # "sim" | "real" | "unknown" (from the daemon status API)
         self.audio: bool = False  # whether the SDK client has a working audio backend
         self.busy_action: str | None = None  # name of the in-flight long motion, if any
+        self.power_state: str = "live"  # "live" | "sleep" — drives motion guards + mic gating
+        self.listen_mode: str = "wake"  # "realtime" | "wake" — mic routing while live
+        self.wake_word_active: bool = False  # router armed AND wake model loaded
+        self.gate_open: bool = False  # audio currently flowing to the consumer
         self.head_joints: list[float] = []
         self.antenna_joints: list[float] = []
         # Speaker / mic volume (0-100) from the daemon volume API; None = unknown.
@@ -145,10 +171,16 @@ class RobotState:
             tuple(self.antenna_joints),
             self.volume,
             self.microphone_volume,
+            self.power_state,
+            self.listen_mode,
+            self.wake_word_active,
+            self.gate_open,
         )
 
 
-def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
+def build_server(
+    mini: ReachyMini, state: RobotState, router: AudioRouter | None = None
+) -> SlopServer:
     """Construct the SLOP server: nodes read the cache, actions drive the robot."""
     slop = SlopServer("reachy", "Reachy Mini")
     emotions = RecordedMoveLibrary(DEFAULT_EMOTIONS_DATASET)
@@ -170,6 +202,14 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
                 f"Robot is busy with {state.busy_action!r}. Wait for the "
                 "action-finished event (or status.busy == false), or cancel a "
                 "playing move with the behavior 'stop' affordance.",
+            )
+
+    def ensure_awake(action: str) -> None:
+        if state.power_state == "sleep":
+            raise SlopActionError(
+                "conflict",
+                f"Robot is asleep (motor torque off) — {action} is unavailable. "
+                "Invoke the behavior 'wake_up' affordance first.",
             )
 
     def start_motion(name: str, work_factory: Callable[[], Awaitable[None]]) -> dict[str, Any]:
@@ -197,6 +237,69 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         # slop_ai turns "__async": True into result status "accepted".
         return {"__async": True, "action": name}
 
+    # --- Power state (sleep/live) + microphone routing -----------------------------
+    #
+    # power_state gates motion (sleep = torque off, so motion affordances are
+    # rejected) and drives the audio router: asleep the mic stream is muted with
+    # the wake word armed; live it follows listen_mode (open mic vs wake-gated).
+    # See audio_router.py. Without a router (stub runs, --no-audio-router, no
+    # audio backend) the state machine still works — only voice wake is missing.
+
+    def apply_audio_state() -> None:
+        if router is None:
+            return
+        if state.power_state == "sleep":
+            router.set_mode(RouterMode.MUTED)
+        elif state.listen_mode == "realtime":
+            router.set_mode(RouterMode.REALTIME)
+        else:
+            router.set_mode(RouterMode.WAKE)
+
+    def set_power_state(value: str) -> None:
+        if state.power_state == value:
+            return
+        state.power_state = value
+        apply_audio_state()
+        slop.emit_event("power-state-changed", {"power_state": value})
+        slop.refresh()
+
+    def wake_motion_work() -> Callable[[], Awaitable[None]]:
+        async def work() -> None:
+            # Mirror the daemon's wake sequence: torque on, then the emote.
+            await asyncio.to_thread(mini.enable_motors)
+            await asyncio.to_thread(mini.wake_up)
+
+        return work
+
+    def on_wake_word(event: WakeEvent) -> None:
+        """Router callback (asyncio loop): the wake word was just heard.
+
+        The router has already opened its gate from the capture thread, so the
+        speech following the wake word is streaming regardless of how long the
+        wake motion takes.
+        """
+        was_asleep = state.power_state == "sleep"
+        slop.emit_event(
+            "wake-word-detected",
+            {"model": event.model, "score": round(event.score, 3), "asleep": was_asleep},
+        )
+        if not was_asleep:
+            slop.refresh()  # gate_open changed; nothing else to do while live
+            return
+        logger.info("voice wake from sleep (score=%.2f)", event.score)
+        state.power_state = "live"
+        state.listen_mode = "wake"  # one-breath wake lands in the gated mode
+        slop.emit_event("power-state-changed", {"power_state": "live"})
+        try:
+            start_motion("wake_up", wake_motion_work())
+        except SlopActionError:
+            # A motion is somehow in flight; stay live without the emote.
+            logger.info("skipping wake emote: %s", state.busy_action)
+        slop.refresh()
+
+    if router is not None:
+        router.set_wake_handler(on_wake_word)
+
     # --- Nodes (read cache only) ------------------------------------------------
     #
     # Defined here but registered at the bottom of build_server, AFTER the action
@@ -214,13 +317,21 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
                 "audio": state.audio,
                 "busy": state.busy_action is not None,
                 "current_action": state.busy_action,
+                "power_state": state.power_state,
+                "listen_mode": state.listen_mode,
+                "wake_word_active": state.wake_word_active,
+                "audio_gate_open": state.gate_open,
                 "head_joints": state.head_joints,
                 "antenna_joints": state.antenna_joints,
             },
             "summary": (
                 f"Reachy Mini ({state.mode}). Live head + antenna joint positions, in radians. "
                 "head_joints = [body_yaw, stewart_1..6]; antenna_joints = [right, left]. "
-                "busy/current_action track in-flight long motions."
+                "busy/current_action track in-flight long motions. While power_state "
+                "is 'sleep', motors are off and motion affordances are rejected; the "
+                "microphone is muted with the wake word armed (wake_word_active). "
+                "listen_mode 'wake' streams mic audio only after the wake word "
+                "(audio_gate_open shows when it flows); 'realtime' streams everything."
             ),
         }
         if not state.connected:
@@ -262,6 +373,12 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
                 "list_emotions": {},
                 "enable_wobbling": {},
                 "disable_wobbling": {},
+            }
+        elif state.power_state == "sleep":
+            # Asleep: torque is off, so only waking (and harmless reads) make sense.
+            desc["actions"] = {
+                "wake_up": {},
+                "list_emotions": {},
             }
         else:
             # Idle: everything except stop (nothing to cancel).
@@ -308,6 +425,7 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
     async def goto_pose(
         pitch: float, roll: float, yaw: float, z: float, duration: float
     ) -> dict[str, Any]:
+        ensure_awake("goto_pose")
         pose = create_head_pose(z=z, roll=roll, pitch=pitch, yaw=yaw, mm=True, degrees=True)
 
         async def work() -> None:
@@ -346,6 +464,7 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         estimate="fast",
     )
     async def set_pose(pitch: float, roll: float, yaw: float, z: float) -> dict[str, Any]:
+        ensure_awake("set_pose")
         ensure_not_busy("set_pose")
         pose = create_head_pose(z=z, roll=roll, pitch=pitch, yaw=yaw, mm=True, degrees=True)
         await asyncio.to_thread(mini.set_target, head=pose)
@@ -367,6 +486,7 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         estimate="fast",
     )
     async def set_antennas(right: float, left: float) -> dict[str, Any]:
+        ensure_awake("set_antennas")
         ensure_not_busy("set_antennas")
         await asyncio.to_thread(mini.set_target, antennas=[right, left])
         return {"ok": True, "antennas": [right, left]}
@@ -375,35 +495,43 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         "behavior",
         "wake_up",
         label="Wake up",
-        description="Enable motor torque and play the wake-up emote (with sound).",
+        description=(
+            "Enable motor torque and play the wake-up emote (with sound). From "
+            "sleep this also restores microphone streaming (per listen_mode)."
+        ),
         estimate="async",
     )
     async def wake_up() -> dict[str, Any]:
-        async def work() -> None:
-            # Mirror the daemon's wake sequence: torque on, then the emote.
-            await asyncio.to_thread(mini.enable_motors)
-            await asyncio.to_thread(mini.wake_up)
-
-        return start_motion("wake_up", work)
+        result = start_motion("wake_up", wake_motion_work())
+        set_power_state("live")
+        return result
 
     @slop.action(
         "behavior",
         "goto_sleep",
         label="Go to sleep",
         description=(
-            "Play the sleep emote (with sound) and disable motor torque. The robot "
-            "will not move again until wake_up is invoked."
+            "Play the sleep emote (with sound) and disable motor torque. The "
+            "microphone stream mutes immediately, with the wake word armed — the "
+            "robot stays asleep until wake_up is invoked or the wake word is heard."
         ),
         estimate="async",
     )
     async def goto_sleep() -> dict[str, Any]:
+        ensure_not_busy("goto_sleep")  # don't mute the mic on a doomed invoke
+
         async def work() -> None:
             # Mirror the daemon's sleep sequence: torque on, sleep pose, torque off.
             await asyncio.to_thread(mini.enable_motors)
             await asyncio.to_thread(mini.goto_sleep)
             await asyncio.to_thread(mini.disable_motors)
 
-        return start_motion("goto_sleep", work)
+        result = start_motion("goto_sleep", work)
+        # Mute before the emote finishes: once sleep is requested, no real audio
+        # leaves the robot (the wake-word veto for the emote itself is in
+        # allow_wake, keyed on busy_action).
+        set_power_state("sleep")
+        return result
 
     @slop.action(
         "behavior",
@@ -439,6 +567,7 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         estimate="async",
     )
     async def play_emotion(name: str) -> dict[str, Any]:
+        ensure_awake("play_emotion")
         ensure_not_busy("play_emotion")  # fail fast before the (possibly slow) validation
         library = await asyncio.to_thread(emotions.load)
         available = sorted(library.list_moves())
@@ -475,6 +604,7 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
 
     @slop.action("behavior", "enable_wobbling", label="Enable wobbling", estimate="instant")
     async def enable_wobbling() -> dict[str, Any]:
+        ensure_awake("enable_wobbling")
         await asyncio.to_thread(mini.enable_wobbling)
         return {"ok": True}
 
@@ -486,7 +616,7 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
     # --- Audio node + affordances (volume via the daemon REST API) --------------
 
     def audio_node() -> dict[str, Any]:
-        return {
+        desc: dict[str, Any] = {
             "type": "control",
             "props": {
                 "available": state.audio,
@@ -497,8 +627,19 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
                 "Robot speaker and microphone. Volumes are 0-100, controlled through "
                 "the daemon. set_volume also plays a short confirmation sound; "
                 "test_sound checks the speaker without changing anything."
+                + (
+                    " set_listen_mode picks how the mic streams while live: "
+                    "'realtime' (open mic) or 'wake' (only after the wake word)."
+                    if router is not None
+                    else ""
+                )
             ),
         }
+        actions = {"set_volume": {}, "set_microphone_volume": {}, "test_sound": {}}
+        if router is not None:
+            actions["set_listen_mode"] = {}
+        desc["actions"] = actions
+        return desc
 
     @slop.action(
         "audio",
@@ -552,6 +693,34 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         await asyncio.to_thread(mini.media.play_sound, "impatient1.wav")
         return {"ok": True}
 
+    @slop.action(
+        "audio",
+        "set_listen_mode",
+        params={
+            "mode": {
+                "type": "string",
+                "description": (
+                    "'realtime' streams every mic frame to the voice pipeline; "
+                    "'wake' streams only after the wake word, until end of speech."
+                ),
+            },
+        },
+        label="Set listen mode",
+        description=(
+            "Choose how the microphone streams while the robot is live. Takes "
+            "effect immediately when live; while asleep it is stored and applied "
+            "on wake_up."
+        ),
+        estimate="instant",
+    )
+    async def set_listen_mode(mode: str) -> dict[str, Any]:
+        if mode not in ("realtime", "wake"):
+            raise SlopActionError("invalid_params", "mode must be 'realtime' or 'wake'")
+        state.listen_mode = mode
+        apply_audio_state()
+        slop.refresh()
+        return {"ok": True, "listen_mode": mode, "power_state": state.power_state}
+
     # Register nodes last — see the comment above status_node.
     slop.node("status")(status_node)
     slop.node("head")(head_node)
@@ -561,7 +730,9 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
     return slop
 
 
-async def poll_state(mini: ReachyMini, state: RobotState, slop: SlopServer) -> None:
+async def poll_state(
+    mini: ReachyMini, state: RobotState, slop: SlopServer, router: AudioRouter | None = None
+) -> None:
     """Refresh the cached joint state ~5 Hz; emit patches only when it changes."""
     tick = 0
     while True:
@@ -573,6 +744,11 @@ async def poll_state(mini: ReachyMini, state: RobotState, slop: SlopServer) -> N
             if tick % VOLUME_POLL_EVERY == 0:
                 # Volume can change outside SLOP (dashboard, curl) — keep it honest.
                 await asyncio.to_thread(fetch_volumes, state)
+            if router is not None:
+                # The router mutates these from its capture thread; mirror them
+                # into the cache so gate transitions show up as patches.
+                state.wake_word_active = router.wake_ready and router.mode != "realtime"
+                state.gate_open = router.gate_open
             state.connected = True
             state.head_joints = [round(float(v), JOINT_ROUNDING) for v in head_joints]
             state.antenna_joints = [round(float(v), JOINT_ROUNDING) for v in antenna_joints]
@@ -672,6 +848,10 @@ async def run(
     media_backend: str,
     wake_on_start: bool = True,
     sleep_on_exit: bool = True,
+    initial_state: str = "live",
+    listen_mode: str = "wake",
+    audio_router_enabled: bool = True,
+    router_config: AudioRouterConfig | None = None,
 ) -> None:
     logger.info("connecting to Reachy Mini daemon (media_backend=%s)...", media_backend)
     try:
@@ -691,10 +871,38 @@ async def run(
     state = RobotState()
     state.audio = getattr(mini.media_manager, "audio", None) is not None
     state.mode = await asyncio.to_thread(fetch_daemon_mode)
+    state.power_state = initial_state
+    state.listen_mode = listen_mode
     await asyncio.to_thread(fetch_volumes, state)
     logger.info("mode=%s audio=%s volume=%s", state.mode, state.audio, state.volume)
-    slop = build_server(mini, state)
 
+    router: AudioRouter | None = None
+    if audio_router_enabled and state.audio:
+        router = AudioRouter(
+            mini.media,
+            router_config or AudioRouterConfig(),
+            # The wake handler is attached in build_server; veto detections
+            # while the sleep/wake emotes themselves play (their sounds and the
+            # user echoing the word mid-transition must not re-trigger).
+            allow_wake=lambda: state.busy_action not in ("goto_sleep", "wake_up"),
+        )
+    elif audio_router_enabled:
+        logger.warning("audio backend unavailable — mic routing and wake word disabled")
+
+    slop = build_server(mini, state, router)
+
+    if router is not None:
+        initial_mode = (
+            RouterMode.MUTED
+            if initial_state == "sleep"
+            else RouterMode.REALTIME
+            if listen_mode == "realtime"
+            else RouterMode.WAKE
+        )
+        await router.start(initial_mode)
+
+    if initial_state == "sleep":
+        wake_on_start = False  # stay down: muted mic, wake word armed
     if wake_on_start:
         # The provider performs the wake-up (not the daemon) so the emote sound
         # plays through our working audio path — the daemon's media server needs
@@ -713,7 +921,7 @@ async def run(
     write_descriptor(descriptor_path, socket_path)
     logger.info("SLOP provider listening on unix:%s (mode=%s)", socket_path, state.mode)
 
-    poll_task = asyncio.create_task(poll_state(mini, state, slop))
+    poll_task = asyncio.create_task(poll_state(mini, state, slop, router))
 
     # Shut down cleanly on SIGINT/SIGTERM.
     stop = asyncio.Event()
@@ -728,6 +936,13 @@ async def run(
         await stop.wait()
     finally:
         logger.info("shutting down...")
+        if router is not None:
+            # Stop the mic stream first: clients see EOF (and exit non-zero, so
+            # the consumer backs off) and no shutdown audio leaks out.
+            try:
+                await router.stop()
+            except Exception:
+                logger.debug("audio router stop failed", exc_info=True)
         if sleep_on_exit:
             # Sleep with sound while our audio path is still open; the daemon's
             # own goto-sleep-on-stop stays enabled as a (silent) safety net.
@@ -784,7 +999,67 @@ def main() -> None:
         default=True,
         help="Put the robot to sleep (with sound) when the provider shuts down.",
     )
+    parser.add_argument(
+        "--initial-state",
+        default="live",
+        choices=["live", "sleep"],
+        help="Start live, or asleep with the wake word armed (implies --no-wake-on-start).",
+    )
+    parser.add_argument(
+        "--listen-mode",
+        default="wake",
+        choices=["wake", "realtime"],
+        help="Mic routing while live: gated behind the wake word, or open mic.",
+    )
+    parser.add_argument(
+        "--audio-router",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Serve the gated microphone stream (and wake-word detection).",
+    )
+    parser.add_argument(
+        "--audio-socket",
+        default=DEFAULT_AUDIO_SOCKET,
+        help="Unix socket path for the PCM16 microphone stream.",
+    )
+    parser.add_argument(
+        "--wake-model",
+        default=DEFAULT_WAKE_MODEL,
+        help="openWakeWord model name, or a path to a custom .onnx model.",
+    )
+    parser.add_argument(
+        "--wake-threshold",
+        type=float,
+        default=0.5,
+        help="Wake-word detection score threshold (0-1).",
+    )
+    parser.add_argument(
+        "--silence-stop-seconds",
+        type=float,
+        default=1.5,
+        help="Close the wake-gated stream after this much silence.",
+    )
+    parser.add_argument(
+        "--preroll-seconds",
+        type=float,
+        default=0.3,
+        help="Audio replayed when the gate opens (covers the detection lag).",
+    )
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.012,
+        help="RMS voice-activity threshold used to detect end of speech.",
+    )
     args = parser.parse_args()
+    router_config = AudioRouterConfig(
+        socket_path=args.audio_socket,
+        wake_model=args.wake_model,
+        wake_threshold=args.wake_threshold,
+        silence_stop_s=args.silence_stop_seconds,
+        preroll_s=args.preroll_seconds,
+        vad_threshold=args.vad_threshold,
+    )
     asyncio.run(
         run(
             args.socket,
@@ -792,6 +1067,10 @@ def main() -> None:
             args.media_backend,
             wake_on_start=args.wake_on_start,
             sleep_on_exit=args.sleep_on_exit,
+            initial_state=args.initial_state,
+            listen_mode=args.listen_mode,
+            audio_router_enabled=args.audio_router,
+            router_config=router_config,
         )
     )
 
