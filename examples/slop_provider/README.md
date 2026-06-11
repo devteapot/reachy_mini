@@ -104,6 +104,15 @@ uv pip install "slop-ai>=0.2"
 uv pip install "openwakeword>=0.6" onnxruntime
 ```
 
+On **Linux with Python ≥ 3.12** (e.g. the Pi) that last install fails:
+openwakeword hard-depends on `tflite-runtime` there, which has no wheels past
+cp311. The provider only uses the onnx path, so drop the dep with an override:
+
+```bash
+echo "tflite-runtime; sys_platform == 'never'" > /tmp/oww-override.txt
+uv pip install --override /tmp/oww-override.txt "openwakeword>=0.6" onnxruntime
+```
+
 If GStreamer audio can't initialise at provider startup, it falls back to
 `no_media` (motion works, sounds are skipped, `/status.audio` is `false`).
 

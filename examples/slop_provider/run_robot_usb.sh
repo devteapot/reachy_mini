@@ -23,6 +23,7 @@ if [[ -f .venv/bin/activate ]]; then
     # Soft check: the provider degrades to affordance-only wake without it.
     echo "[run_robot_usb] note: openwakeword not installed — wake-by-voice disabled." >&2
     echo "[run_robot_usb]       uv pip install 'openwakeword>=0.6' onnxruntime" >&2
+    echo "[run_robot_usb]       (fails on linux+py3.12+? see the tflite-runtime override in README.md)" >&2
   fi
 elif command -v reachy-mini-daemon > /dev/null 2>&1; then
   echo "[run_robot_usb] no .venv here — using reachy-mini-daemon from PATH"
