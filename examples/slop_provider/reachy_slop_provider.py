@@ -10,8 +10,11 @@ Discovery: on startup this writes a descriptor to ``/tmp/slop/providers/reachy.j
 provider with no config changes. The descriptor and its directory follow the spec's
 filesystem hardening rules (0700 dir, 0600 file, atomic rename, pid for staleness).
 
-Scope (Phase 1 tracer): movement + behaviors only, no audio. The robot is driven
-with ``media_backend="no_media"`` so no GStreamer/audio stack is required.
+Scope: movement + behaviors. Emotion/emote sounds play through the robot's
+speaker when the SDK's local GStreamer audio backend is available (the default,
+``--media-backend local``). Pass ``--media-backend no_media`` to run without any
+GStreamer/audio stack (e.g. sim on a machine without GStreamer); if the local
+backend fails to initialise, the provider falls back to ``no_media`` on its own.
 
 State tree::
 
@@ -120,6 +123,7 @@ class RobotState:
     def __init__(self) -> None:
         self.connected: bool = False
         self.mode: str = "unknown"  # "sim" | "real" | "unknown" (from the daemon status API)
+        self.audio: bool = False  # whether the SDK client has a working audio backend
         self.busy_action: str | None = None  # name of the in-flight long motion, if any
         self.head_joints: list[float] = []
         self.antenna_joints: list[float] = []
@@ -194,6 +198,7 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
             "props": {
                 "connected": state.connected,
                 "mode": state.mode,
+                "audio": state.audio,
                 "busy": state.busy_action is not None,
                 "current_action": state.busy_action,
                 "head_joints": state.head_joints,
@@ -392,7 +397,8 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         label="Play emotion",
         description=(
             "Play one recorded move from the default Reachy Mini emotions library. "
-            "The robot first moves to the recording's initial pose over 1 second. "
+            "The robot first moves to the recording's initial pose over 1 second; "
+            "the move's bundled sound plays when status.audio is true. "
             "Returns 'accepted' and plays in the background — cancel with stop, "
             "watch status.busy / the action-finished event."
         ),
@@ -410,7 +416,7 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         move = await asyncio.to_thread(library.get, name)
 
         async def work() -> None:
-            await mini.async_play_move(move, initial_goto_duration=1.0, sound=False)
+            await mini.async_play_move(move, initial_goto_duration=1.0, sound=state.audio)
 
         result = start_motion("play_emotion", work)
         result.update({"emotion": name, "dataset": emotions.dataset_name})
@@ -520,13 +526,26 @@ def write_descriptor(path: str, socket_path: str) -> None:
     logger.info("wrote discovery descriptor: %s", path)
 
 
-async def run(socket_path: str, descriptor_path: str) -> None:
-    logger.info("connecting to Reachy Mini daemon (media_backend=no_media)...")
-    mini = ReachyMini(media_backend="no_media")
+async def run(socket_path: str, descriptor_path: str, media_backend: str) -> None:
+    logger.info("connecting to Reachy Mini daemon (media_backend=%s)...", media_backend)
+    try:
+        mini = ReachyMini(media_backend=media_backend)
+    except Exception:
+        if media_backend == "no_media":
+            raise
+        logger.warning(
+            "media backend %r failed to initialise (GStreamer missing?); "
+            "falling back to no_media — emotion sounds will be skipped",
+            media_backend,
+            exc_info=True,
+        )
+        mini = ReachyMini(media_backend="no_media")
     logger.info("connected.")
 
     state = RobotState()
+    state.audio = getattr(mini.media_manager, "audio", None) is not None
     state.mode = await asyncio.to_thread(fetch_daemon_mode)
+    logger.info("mode=%s audio=%s", state.mode, state.audio)
     slop = build_server(mini, state)
 
     server = await listen_unix(slop, socket_path)
@@ -572,8 +591,18 @@ def main() -> None:
     parser.add_argument(
         "--descriptor", default=DEFAULT_DESCRIPTOR, help="Discovery descriptor path to write"
     )
+    parser.add_argument(
+        "--media-backend",
+        default="local",
+        choices=["local", "no_media", "webrtc"],
+        help=(
+            "SDK media backend for the provider's robot client. 'local' (default) "
+            "plays emotion/emote sounds on the robot speaker via GStreamer and "
+            "falls back to 'no_media' if it can't initialise."
+        ),
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.socket, args.descriptor))
+    asyncio.run(run(args.socket, args.descriptor, args.media_backend))
 
 
 if __name__ == "__main__":

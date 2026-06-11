@@ -36,8 +36,8 @@ sloppy (TS SLOP consumer)
 - `set_antennas` — `right`/`left` angles in **radians**.
 - `list_emotions` / `play_emotion(name)` — default recorded emotions from
   `pollen-robotics/reachy-mini-emotions-library`. The first call may cache the
-  dataset from Hugging Face. Motion plays without bundled sounds while this
-  provider runs with `media_backend="no_media"`.
+  dataset from Hugging Face. The move's bundled sound plays on the robot speaker
+  when `/status.audio` is true (default `--media-backend local`).
 
 **Async motion + busy state.** Long motions (`goto_pose`, `wake_up`, `goto_sleep`,
 `play_emotion`) follow the SLOP async-actions extension: the invoke returns
@@ -61,6 +61,21 @@ uv pip install -e "/Users/carlid/dev/reachy_mini[mujoco]"
 # SLOP SDK from PyPI (0.2 line — matches sloppy's @slop-ai/* 0.2.0)
 uv pip install "slop-ai>=0.2"
 ```
+
+## Physical robot (USB / Lite): one script
+
+For a real robot connected over USB, one launcher starts both the daemon
+(serial port auto-detect, headless) and the SLOP provider, and stops the daemon
+again on Ctrl-C:
+
+```bash
+./run_robot_usb.sh                # extra args go to the daemon
+```
+
+If a daemon is already running on `:8000` it is reused (and left running on
+exit). The daemon wakes the robot on start by default; pass
+`--no-wake-up-on-start` to keep it asleep until the agent invokes `wake_up`.
+`/status.mode` will report `real`. Then start sloppy as in step 3 below.
 
 ## Demo: GUI sim + isolated sloppy (3 terminals)
 
@@ -151,9 +166,11 @@ The agent will `apps → load_provider(reachy)`, after which the `/reachy` affor
 
 ## Notes
 
-- The provider runs the robot with `media_backend="no_media"`, so no GStreamer/audio
-  stack is needed for Phase 1. `wake_up`/`goto_sleep` still perform their head emotes;
-  their sound effects are silently skipped without audio.
+- The provider defaults to `--media-backend local`: emotion moves and the
+  `wake_up`/`goto_sleep` emotes play their bundled sounds on the robot speaker via
+  GStreamer. If GStreamer isn't available (e.g. a sim-only machine) it falls back
+  to `no_media` automatically — motion still works, sounds are skipped, and
+  `/status.audio` reports `false`. Force it with `--media-backend no_media`.
 - Every SDK call is blocking, so actions run it via `asyncio.to_thread` and a background
   task polls joint state into a cache — node functions never call the SDK directly.
 - The discovery descriptor is written per the spec's hardening rules: `0700`
