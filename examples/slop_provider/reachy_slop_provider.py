@@ -19,11 +19,13 @@ backend fails to initialise, the provider falls back to ``no_media`` on its own.
 State tree::
 
     /reachy
-    ├── /status     props: connected, mode, busy, current_action,
+    ├── /status     props: connected, mode, audio, busy, current_action,
     │               head_joints, antenna_joints  (live, polled)
     ├── /head       actions: goto_pose, set_pose, set_antennas
-    └── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
-                    enable_wobbling, disable_wobbling, stop (visible while busy)
+    ├── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
+    │               enable_wobbling, disable_wobbling, stop (visible while busy)
+    └── /audio      props: available, volume, microphone_volume  (polled ~5 s)
+                    actions: set_volume, set_microphone_volume, test_sound
 
 Long-running motion (goto_pose, wake_up, goto_sleep, play_emotion) is async per
 the SLOP async-actions extension: the invoke returns ``status: "accepted"``
@@ -64,8 +66,10 @@ logger = logging.getLogger("reachy-slop")
 DEFAULT_SOCKET = "/tmp/slop/reachy.sock"
 DEFAULT_DESCRIPTOR = "/tmp/slop/providers/reachy.json"
 DEFAULT_EMOTIONS_DATASET = "pollen-robotics/reachy-mini-emotions-library"
-DAEMON_STATUS_URL = "http://localhost:8000/api/daemon/status"
+DAEMON_API_BASE = "http://localhost:8000/api"
+DAEMON_STATUS_URL = f"{DAEMON_API_BASE}/daemon/status"
 POLL_INTERVAL_S = 0.2  # ~5 Hz state poll
+VOLUME_POLL_EVERY = 25  # poll volume every Nth state poll (~5 s) — it rarely changes
 JOINT_ROUNDING = 4  # decimals — stabilises float jitter so we don't emit constant patches
 
 # Must mirror the hello message sent by slop_ai's SlopServer.handle_connection,
@@ -127,12 +131,21 @@ class RobotState:
         self.busy_action: str | None = None  # name of the in-flight long motion, if any
         self.head_joints: list[float] = []
         self.antenna_joints: list[float] = []
+        # Speaker / mic volume (0-100) from the daemon volume API; None = unknown.
+        self.volume: int | None = None
+        self.microphone_volume: int | None = None
         # Last orientation we commanded (degrees / mm), for the /head node props.
         self.last_pose: dict[str, float] = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0, "z": 0.0}
 
     def snapshot_key(self) -> tuple:
         """Value used to decide whether a poll produced a visible change."""
-        return (self.connected, tuple(self.head_joints), tuple(self.antenna_joints))
+        return (
+            self.connected,
+            tuple(self.head_joints),
+            tuple(self.antenna_joints),
+            self.volume,
+            self.microphone_volume,
+        )
 
 
 def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
@@ -449,22 +462,96 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         await asyncio.to_thread(mini.disable_wobbling)
         return {"ok": True}
 
+    # --- Audio node + affordances (volume via the daemon REST API) --------------
+
+    def audio_node() -> dict[str, Any]:
+        return {
+            "type": "control",
+            "props": {
+                "available": state.audio,
+                "volume": state.volume,
+                "microphone_volume": state.microphone_volume,
+            },
+            "summary": (
+                "Robot speaker and microphone. Volumes are 0-100, controlled through "
+                "the daemon. set_volume also plays a short confirmation sound; "
+                "test_sound checks the speaker without changing anything."
+            ),
+        }
+
+    @slop.action(
+        "audio",
+        "set_volume",
+        params={"volume": {"type": "integer", "description": "Speaker volume, 0-100."}},
+        label="Set speaker volume",
+        description=(
+            "Set the robot speaker volume (0-100). The daemon plays a short "
+            "confirmation sound at the new level."
+        ),
+        estimate="fast",
+    )
+    async def set_volume(volume: int) -> dict[str, Any]:
+        if not 0 <= volume <= 100:
+            raise SlopActionError("invalid_params", "volume must be between 0 and 100")
+        data = await asyncio.to_thread(_daemon_post, "/volume/set", {"volume": volume})
+        state.volume = int(data.get("volume", volume))
+        return {"ok": True, "volume": state.volume}
+
+    @slop.action(
+        "audio",
+        "set_microphone_volume",
+        params={"volume": {"type": "integer", "description": "Microphone volume, 0-100."}},
+        label="Set microphone volume",
+        description="Set the robot microphone input volume (0-100).",
+        estimate="fast",
+    )
+    async def set_microphone_volume(volume: int) -> dict[str, Any]:
+        if not 0 <= volume <= 100:
+            raise SlopActionError("invalid_params", "volume must be between 0 and 100")
+        data = await asyncio.to_thread(_daemon_post, "/volume/microphone/set", {"volume": volume})
+        state.microphone_volume = int(data.get("volume", volume))
+        return {"ok": True, "microphone_volume": state.microphone_volume}
+
+    @slop.action(
+        "audio",
+        "test_sound",
+        label="Play test sound",
+        description=(
+            "Play a short test sound through the provider's audio path — the same "
+            "path emotion sounds use. Fails with conflict when audio is unavailable."
+        ),
+        idempotent=True,
+        estimate="fast",
+    )
+    async def test_sound() -> dict[str, Any]:
+        if not state.audio:
+            raise SlopActionError(
+                "conflict", "audio is unavailable (provider is running without a media backend)"
+            )
+        await asyncio.to_thread(mini.media.play_sound, "impatient1.wav")
+        return {"ok": True}
+
     # Register nodes last — see the comment above status_node.
     slop.node("status")(status_node)
     slop.node("head")(head_node)
     slop.node("behavior")(behavior_node)
+    slop.node("audio")(audio_node)
 
     return slop
 
 
 async def poll_state(mini: ReachyMini, state: RobotState, slop: SlopServer) -> None:
     """Refresh the cached joint state ~5 Hz; emit patches only when it changes."""
+    tick = 0
     while True:
         try:
             head_joints, antenna_joints = await asyncio.to_thread(
                 mini.get_current_joint_positions
             )
             prev = state.snapshot_key()
+            if tick % VOLUME_POLL_EVERY == 0:
+                # Volume can change outside SLOP (dashboard, curl) — keep it honest.
+                await asyncio.to_thread(fetch_volumes, state)
             state.connected = True
             state.head_joints = [round(float(v), JOINT_ROUNDING) for v in head_joints]
             state.antenna_joints = [round(float(v), JOINT_ROUNDING) for v in antenna_joints]
@@ -478,20 +565,52 @@ async def poll_state(mini: ReachyMini, state: RobotState, slop: SlopServer) -> N
                 # Broadcast the disconnect once; stay quiet while it lasts.
                 state.connected = False
                 slop.refresh()
+        tick += 1
         await asyncio.sleep(POLL_INTERVAL_S)
 
 
-def fetch_daemon_mode(status_url: str = DAEMON_STATUS_URL) -> str:
+def _daemon_get(path: str, timeout: float = 5.0) -> dict[str, Any]:
+    """GET a daemon REST endpoint, return parsed JSON. Blocking — call via to_thread."""
+    with urllib.request.urlopen(f"{DAEMON_API_BASE}{path}", timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def _daemon_post(path: str, payload: dict[str, Any], timeout: float = 5.0) -> dict[str, Any]:
+    """POST JSON to a daemon REST endpoint. Blocking — call via to_thread."""
+    req = urllib.request.Request(
+        f"{DAEMON_API_BASE}{path}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def fetch_daemon_mode() -> str:
     """Ask the daemon whether it runs a simulated or a real robot."""
     try:
-        with urllib.request.urlopen(status_url, timeout=5) as resp:
-            status = json.loads(resp.read())
+        status = _daemon_get("/daemon/status")
         if status.get("simulation_enabled") or status.get("mockup_sim_enabled"):
             return "sim"
         return "real"
     except Exception:
-        logger.warning("could not read daemon status from %s", status_url, exc_info=True)
+        logger.warning("could not read daemon status", exc_info=True)
         return "unknown"
+
+
+def fetch_volumes(state: RobotState) -> None:
+    """Refresh cached speaker/mic volume from the daemon volume API.
+
+    Quiet on failure (debug log only) — the volume API is unavailable when the
+    daemon is down or in stub runs, and the joint poll already reports that.
+    """
+    for path, attr in (("/volume/current", "volume"), ("/volume/microphone/current", "microphone_volume")):
+        try:
+            setattr(state, attr, int(_daemon_get(path)["volume"]))
+        except Exception:
+            logger.debug("volume fetch failed for %s", path, exc_info=True)
+            setattr(state, attr, None)
 
 
 def write_descriptor(path: str, socket_path: str) -> None:
@@ -545,7 +664,8 @@ async def run(socket_path: str, descriptor_path: str, media_backend: str) -> Non
     state = RobotState()
     state.audio = getattr(mini.media_manager, "audio", None) is not None
     state.mode = await asyncio.to_thread(fetch_daemon_mode)
-    logger.info("mode=%s audio=%s", state.mode, state.audio)
+    await asyncio.to_thread(fetch_volumes, state)
+    logger.info("mode=%s audio=%s volume=%s", state.mode, state.audio, state.volume)
     slop = build_server(mini, state)
 
     server = await listen_unix(slop, socket_path)

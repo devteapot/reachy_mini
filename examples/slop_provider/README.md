@@ -22,18 +22,24 @@ sloppy (TS SLOP consumer)
 
 ```
 /reachy
-├── /status     props: connected, mode, busy, current_action,
+├── /status     props: connected, mode, audio, busy, current_action,
 │               head_joints, antenna_joints                            (live, ~5 Hz)
 ├── /head       actions: goto_pose(pitch,roll,yaw,z,duration),
 │               set_pose(pitch,roll,yaw,z), set_antennas(right,left)
-└── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
-                enable_wobbling, disable_wobbling, stop (visible while busy)
+├── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
+│               enable_wobbling, disable_wobbling, stop (visible while busy)
+└── /audio      props: available, volume, microphone_volume           (polled ~5 s)
+                actions: set_volume(volume), set_microphone_volume(volume), test_sound
 ```
 
 - `goto_pose` — head orientation in **degrees** (+pitch looks **down**, +roll tilts
   right, +yaw turns left), height `z` in **mm**, `duration` in seconds.
 - `set_pose` — same units, immediate (no interpolation); for ~10 Hz animation.
 - `set_antennas` — `right`/`left` angles in **radians**.
+- `set_volume` / `set_microphone_volume` — speaker/mic volume 0-100, via the
+  daemon's REST volume API; current values are polled into `/audio` props every
+  ~5 s so out-of-band changes show up too. `test_sound` plays a short sound
+  through the provider's own audio path (the same one emotions use).
 - `list_emotions` / `play_emotion(name)` — default recorded emotions from
   `pollen-robotics/reachy-mini-emotions-library`. The first call may cache the
   dataset from Hugging Face. The move's bundled sound plays on the robot speaker
