@@ -364,6 +364,12 @@ class AudioRouter:
 
     def _capture_loop(self) -> None:
         acc = np.zeros(0, dtype=np.float32)
+        started = time.monotonic()
+        last_data_at: float | None = None
+        last_warn = started
+        last_report = started
+        frames = 0
+        peak = 0.0
         while not self._stop.is_set():
             try:
                 chunk = self._media.get_audio_sample()  # blocks ≤ 20 ms
@@ -371,12 +377,41 @@ class AudioRouter:
                 logger.warning("audio capture failed; retrying", exc_info=True)
                 time.sleep(0.5)
                 continue
+            now = time.monotonic()
             if chunk is None:
+                # Surface dead capture loudly: a wrong or busy ALSA device
+                # yields an endless stream of None, not an exception.
+                since = now - (last_data_at if last_data_at is not None else started)
+                if since > 5.0 and now - last_warn > 5.0:
+                    logger.warning(
+                        "audio capture: no mic data for %.0f s — wrong or busy "
+                        "capture device? (`arecord -l` should list the Reachy "
+                        "card; `fuser -v /dev/snd/*` shows who holds it)",
+                        since,
+                    )
+                    last_warn = now
                 continue
+            if last_data_at is None:
+                logger.info("audio capture: receiving mic data (%d samples/chunk)", len(chunk))
+            last_data_at = now
+            peak = max(peak, float(np.abs(chunk).max()))
             acc = np.concatenate([acc, chunk.mean(axis=1).astype(np.float32)])
             while len(acc) >= FRAME_SAMPLES:
                 frame, acc = acc[:FRAME_SAMPLES], acc[FRAME_SAMPLES:]
                 self._process_frame(frame)
+                frames += 1
+            if now - last_report >= 10.0:
+                # Periodic level report: speech peaks well above 0.05; a steady
+                # ~0.000 means the device captures but the mic is silent/muted.
+                logger.info(
+                    "audio capture: %.0f frames/s, peak level %.3f (last %.0f s)",
+                    frames / (now - last_report),
+                    peak,
+                    now - last_report,
+                )
+                frames = 0
+                peak = 0.0
+                last_report = now
 
     def _process_frame(self, mono: np.ndarray) -> None:
         pcm16 = (np.clip(mono, -1.0, 1.0) * 32767.0).astype("<i2")
