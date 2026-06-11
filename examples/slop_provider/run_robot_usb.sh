@@ -11,8 +11,30 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# shellcheck disable=SC1091
-source .venv/bin/activate
+if [[ -f .venv/bin/activate ]]; then
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+elif command -v reachy-mini-daemon > /dev/null 2>&1; then
+  echo "[run_robot_usb] no .venv here — using reachy-mini-daemon from PATH"
+else
+  cat >&2 <<'SETUP'
+[run_robot_usb] no .venv in this directory and reachy-mini-daemon not on PATH.
+
+One-time setup (run from examples/slop_provider/):
+
+  uv venv --system-site-packages   # system site packages expose the apt GStreamer
+                                   # bindings (python3-gi) for robot-speaker audio
+  source .venv/bin/activate
+  uv pip install -e ../..          # the Reachy SDK from this clone
+  uv pip install "slop-ai>=0.2"    # the SLOP SDK
+
+If sounds matter, also make sure GStreamer python bindings are installed
+system-wide (Debian/RPi: python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good
+gstreamer1.0-alsa). Without them the provider falls back to no_media (motion
+works, sounds are skipped).
+SETUP
+  exit 1
+fi
 
 STATUS_URL="http://localhost:8000/api/daemon/status"
 DAEMON_LOG="/tmp/reachy_daemon_usb.log"
@@ -56,4 +78,5 @@ else
 fi
 
 echo "[run_robot_usb] starting SLOP provider (Ctrl-C stops provider + daemon)"
-python reachy_slop_provider.py
+PYTHON="$(command -v python || command -v python3)"
+"$PYTHON" reachy_slop_provider.py

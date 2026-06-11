@@ -51,16 +51,25 @@ move), and conflicting motion invokes fail with `error.code: "conflict"`.
 
 Python ≥ 3.10. Using [`uv`](https://docs.astral.sh/uv/):
 
+Run from this directory (`examples/slop_provider/`):
+
 ```bash
-uv venv
+# --system-site-packages exposes the apt GStreamer bindings (python3-gi) inside
+# the venv — needed for robot-speaker audio on Linux/RPi. Harmless elsewhere.
+uv venv --system-site-packages
 source .venv/bin/activate
 
-# Reachy SDK with simulation extras (editable from this clone keeps versions in sync)
-uv pip install -e "/Users/carlid/dev/reachy_mini[mujoco]"
+# Reachy SDK, editable from this clone (add [mujoco] only if you want the simulator)
+uv pip install -e ../..
 
 # SLOP SDK from PyPI (0.2 line — matches sloppy's @slop-ai/* 0.2.0)
 uv pip install "slop-ai>=0.2"
 ```
+
+On Debian/Raspberry Pi OS, audio also needs the system GStreamer bindings:
+`sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good
+gstreamer1.0-alsa`. Without them the provider falls back to `no_media`
+(motion works, sounds are skipped, `/status.audio` is `false`).
 
 ## Physical robot (USB / Lite): one script
 
