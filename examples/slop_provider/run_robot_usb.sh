@@ -63,8 +63,17 @@ else
   # --no-wake-up-on-start: the SLOP provider performs the wake-up instead, so
   # the emote sound plays (the daemon's sounds need the GStreamer Rust webrtc
   # plugin). Extra "$@" args come after and can override.
+  #
+  # setsid detaches the daemon from the terminal's process group: Ctrl-C must
+  # reach only the provider, which plays its audible sleep against a live
+  # daemon; cleanup() then stops the daemon explicitly. Without it, Ctrl-C
+  # hits the daemon simultaneously and the provider's sleep-goto times out.
   echo "[run_robot_usb] starting reachy-mini-daemon (USB, serial auto-detect); log: $DAEMON_LOG"
-  reachy-mini-daemon --no-wake-up-on-start "$@" > "$DAEMON_LOG" 2>&1 &
+  if command -v setsid > /dev/null 2>&1; then
+    setsid reachy-mini-daemon --no-wake-up-on-start "$@" > "$DAEMON_LOG" 2>&1 &
+  else
+    reachy-mini-daemon --no-wake-up-on-start "$@" > "$DAEMON_LOG" 2>&1 &
+  fi
   DAEMON_PID=$!
 
   # Wait for the REST API to come up (motor init + USB detection take a moment).
