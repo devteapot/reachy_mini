@@ -51,12 +51,16 @@ move), and conflicting motion invokes fail with `error.code: "conflict"`.
 
 Python ≥ 3.10. Using [`uv`](https://docs.astral.sh/uv/):
 
-Run from this directory (`examples/slop_provider/`):
+**Linux/RPi first**: the SDK depends on `pygobject` (built from source on Linux)
+and uses GStreamer for audio — install the system packages from
+[`docs/source/SDK/gstreamer-installation.md`](../../docs/source/SDK/gstreamer-installation.md)
+Step 1 (the `apt-get install` line; the Rust WebRTC plugin in Steps 2–3 is only
+needed for browser/remote streaming). macOS/Windows get GStreamer via wheels.
+
+Then, from this directory (`examples/slop_provider/`):
 
 ```bash
-# --system-site-packages exposes the apt GStreamer bindings (python3-gi) inside
-# the venv — needed for robot-speaker audio on Linux/RPi. Harmless elsewhere.
-uv venv --system-site-packages
+uv venv
 source .venv/bin/activate
 
 # Reachy SDK, editable from this clone (add [mujoco] only if you want the simulator)
@@ -66,10 +70,8 @@ uv pip install -e ../..
 uv pip install "slop-ai>=0.2"
 ```
 
-On Debian/Raspberry Pi OS, audio also needs the system GStreamer bindings:
-`sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good
-gstreamer1.0-alsa`. Without them the provider falls back to `no_media`
-(motion works, sounds are skipped, `/status.audio` is `false`).
+If GStreamer audio can't initialise at provider startup, it falls back to
+`no_media` (motion works, sounds are skipped, `/status.audio` is `false`).
 
 ## Physical robot (USB / Lite): one script
 

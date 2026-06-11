@@ -22,16 +22,15 @@ else
 
 One-time setup (run from examples/slop_provider/):
 
-  uv venv --system-site-packages   # system site packages expose the apt GStreamer
-                                   # bindings (python3-gi) for robot-speaker audio
+  # Linux/RPi first: system packages for GStreamer + the pygobject build
+  # (full apt line in docs/source/SDK/gstreamer-installation.md, Step 1 —
+  #  notably libgirepository1.0-dev and libcairo2-dev; the SDK builds
+  #  pygobject from source on Linux)
+
+  uv venv
   source .venv/bin/activate
   uv pip install -e ../..          # the Reachy SDK from this clone
   uv pip install "slop-ai>=0.2"    # the SLOP SDK
-
-If sounds matter, also make sure GStreamer python bindings are installed
-system-wide (Debian/RPi: python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good
-gstreamer1.0-alsa). Without them the provider falls back to no_media (motion
-works, sounds are skipped).
 SETUP
   exit 1
 fi
