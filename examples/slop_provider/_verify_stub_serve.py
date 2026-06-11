@@ -50,6 +50,12 @@ class FakeMini:
         if antennas:
             self._antennas = [round(float(a), 4) for a in antennas]
 
+    def enable_motors(self, ids=None):
+        self.calls.append(("enable_motors", ids))
+
+    def disable_motors(self, ids=None):
+        self.calls.append(("disable_motors", ids))
+
     def wake_up(self):
         self.calls.append(("wake_up",))
 

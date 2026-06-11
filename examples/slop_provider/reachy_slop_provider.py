@@ -251,7 +251,8 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
             "summary": (
                 "High-level behaviors: wake_up and goto_sleep emotes, default recorded "
                 "emotion moves, and audio-reactive head wobbling (visible motion only "
-                "when audio is playing)."
+                "when audio is playing). After goto_sleep, motor torque is off — head "
+                "and antenna commands will not move the robot until wake_up."
             ),
         }
         if state.busy_action is not None:
@@ -370,17 +371,37 @@ def build_server(mini: ReachyMini, state: RobotState) -> SlopServer:
         await asyncio.to_thread(mini.set_target, antennas=[right, left])
         return {"ok": True, "antennas": [right, left]}
 
-    @slop.action("behavior", "wake_up", label="Wake up", estimate="async")
+    @slop.action(
+        "behavior",
+        "wake_up",
+        label="Wake up",
+        description="Enable motor torque and play the wake-up emote (with sound).",
+        estimate="async",
+    )
     async def wake_up() -> dict[str, Any]:
         async def work() -> None:
+            # Mirror the daemon's wake sequence: torque on, then the emote.
+            await asyncio.to_thread(mini.enable_motors)
             await asyncio.to_thread(mini.wake_up)
 
         return start_motion("wake_up", work)
 
-    @slop.action("behavior", "goto_sleep", label="Go to sleep", estimate="async")
+    @slop.action(
+        "behavior",
+        "goto_sleep",
+        label="Go to sleep",
+        description=(
+            "Play the sleep emote (with sound) and disable motor torque. The robot "
+            "will not move again until wake_up is invoked."
+        ),
+        estimate="async",
+    )
     async def goto_sleep() -> dict[str, Any]:
         async def work() -> None:
+            # Mirror the daemon's sleep sequence: torque on, sleep pose, torque off.
+            await asyncio.to_thread(mini.enable_motors)
             await asyncio.to_thread(mini.goto_sleep)
+            await asyncio.to_thread(mini.disable_motors)
 
         return start_motion("goto_sleep", work)
 
@@ -681,6 +702,9 @@ async def run(
         # starts the daemon with --no-wake-up-on-start accordingly.
         logger.info("waking up the robot...")
         try:
+            # Torque first: with --no-wake-up-on-start the daemon never enables
+            # motor control, so without this the emote is sound-only.
+            await asyncio.to_thread(mini.enable_motors)
             await asyncio.to_thread(mini.wake_up)
         except Exception:
             logger.warning("wake-up on start failed", exc_info=True)
@@ -707,8 +731,11 @@ async def run(
         if sleep_on_exit:
             # Sleep with sound while our audio path is still open; the daemon's
             # own goto-sleep-on-stop stays enabled as a (silent) safety net.
+            # Same sequence as the daemon: torque on, sleep pose, torque off.
             try:
+                await asyncio.to_thread(mini.enable_motors)
                 await asyncio.to_thread(mini.goto_sleep)
+                await asyncio.to_thread(mini.disable_motors)
             except Exception:
                 logger.warning("goto-sleep on exit failed", exc_info=True)
         poll_task.cancel()
