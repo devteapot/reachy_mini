@@ -12,9 +12,12 @@
 #            → voice /tts → Voxtral 4B TTS via vLLM-Omni (spark :8091)
 #            → playback + runtime-driven head motion on the Reachy.
 #
-# NOTE: the Spark endpoints are non-localhost, so sloppy's voice network policy
-# asks for one approval in the TUI when the conversation loop starts listening
-# (createSpeechNetworkRule gates start_listening, then re-invokes preApproved).
+# NOTE: STT/TTS go through localhost forwarders (run_spark_proxy.sh → socat →
+# Spark). sloppy's voice policy only auto-starts the hands-free loop when both
+# speech endpoints are local, and in `session serve` mode nothing can drive the
+# remote-endpoint approval flow (the agent is blind to its own session
+# provider's /conversation node, and the TUI has no start_listening control).
+# The LLM endpoint is not part of the voice policy and stays direct.
 
 # LLM: Qwen3.6 brain on the Spark. The server defaults to non-thinking
 # (--default-chat-template-kwargs '{"enable_thinking": false}') and parses tool
@@ -98,7 +101,7 @@ plugins:
         nemotron-spark:
           protocol: realtime-stt
           dialect: openai
-          baseUrl: ws://192.168.1.103:8002/v1/realtime
+          baseUrl: ws://127.0.0.1:8002/v1/realtime # run_spark_proxy.sh → Spark
           auth:
             type: none
           sampleRate: 16000
@@ -116,7 +119,7 @@ plugins:
         # Streams 24 kHz PCM from /v1/audio/speech.
         voxtral:
           protocol: openai-speech
-          baseUrl: http://192.168.1.103:8091/v1
+          baseUrl: http://127.0.0.1:8091/v1 # run_spark_proxy.sh → Spark
           auth:
             type: none
           model: mistralai/Voxtral-4B-TTS-2603
@@ -147,7 +150,7 @@ plugins:
       enabled: true
       providerId: reachy
     realtime:
-      autoStartMode: continuous # hands-free from boot; Spark endpoints need one TUI approval
+      autoStartMode: continuous # hands-free from boot; localhost endpoints auto-start (no approval)
       defaultStartMode: continuous
 
 session:
