@@ -1,24 +1,44 @@
-# Sloppy config for the Reachy Mini VOICE demo (Phase 2).
+# Sloppy config for the Reachy Mini VOICE demo (Phase 3 — full DGX Spark stack).
 #
 # Loaded in isolation from your global ~/.sloppy config by running sloppy with
 # HOME pointed at this `demo/` directory (see run_sloppy_demo.sh). Your global
 # config is untouched.
 #
-# Pipeline (all local except the Voxtral TTS, which the voice gateway fronts on
-# localhost so it counts as local to the voice policy):
+# Pipeline (everything on the DGX Spark via spark/reachy-mini.yaml in home-lab;
+# no voice gateway needed):
 #   mic → provider audio router (sleep/wake + wake-word gate, audio_router.py)
-#       → voice /stt → Parakeet (voice_gateway :8090)
-#            → agent turn → Qwen3-4B via mlx-lm (:8080)
-#            → voice /tts → Voxtral on the spark (via voice_gateway :8090 proxy)
-#            → afplay  + runtime-driven head motion on the simulated Reachy.
+#       → voice /stt → Nemotron 3.5 ASR streaming (spark :8002, ws /v1/realtime)
+#            → agent turn → Qwen3.6-35B-A3B-NVFP4 + MTP (spark :8000)
+#            → voice /tts → Voxtral 4B TTS via vLLM-Omni (spark :8091)
+#            → playback + runtime-driven head motion on the Reachy.
+#
+# NOTE: the Spark endpoints are non-localhost, so sloppy's voice network policy
+# asks for one approval in the TUI when the conversation loop starts listening
+# (createSpeechNetworkRule gates start_listening, then re-invokes preApproved).
 
-# LLM: OpenAI Codex (gpt-5.4-mini) — faster than the local mlx model. Uses your
-# Codex login (run_sloppy_demo.sh sets SLOPPY_CODEX_AUTH_PATH to ~/.codex/auth.json
-# despite the HOME override). gpt-5.4-mini isn't in sloppy's built-in catalog, so
-# the endpoint is defined here with the codex-compatible model metadata.
+# LLM: Qwen3.6 brain on the Spark. The server defaults to non-thinking
+# (--default-chat-template-kwargs '{"enable_thinking": false}') and parses tool
+# calls with qwen3_xml, so no thinking/compat handling is needed client-side.
+# The codex profile is kept as a manual fallback.
 llm:
-  defaultProfileId: codex-mini
+  defaultProfileId: spark-brain
   endpoints:
+    spark:
+      label: Spark Qwen3.6 brain
+      protocol: openai-chat
+      baseUrl: http://192.168.1.96:8000/v1
+      auth:
+        type: none
+      models:
+        Qwen3.6-35B-A3B-NVFP4:
+          label: Qwen3.6-35B-A3B NVFP4 (Spark)
+          contextWindowTokens: 65536
+          maxOutputTokens: 8192
+          capabilities:
+            tools: true
+          compat:
+            kind: openai
+            thinkingFormat: none
     codex:
       label: OpenAI Codex
       protocol: openai-codex
@@ -38,6 +58,11 @@ llm:
             maxTokensField: max_completion_tokens
             thinkingFormat: openai
   profiles:
+    - kind: native
+      id: spark-brain
+      label: Spark Qwen3.6 brain
+      endpointId: spark
+      model: Qwen3.6-35B-A3B-NVFP4
     - kind: native
       id: codex-mini
       label: Codex gpt-5.4-mini
@@ -62,35 +87,40 @@ plugins:
   filesystem:
     enabled: false
 
-  # Voice provider: STT + TTS as SLOP affordances. Both endpoints point at the
-  # local voice gateway (run_voice_gateway.sh) on :8090 with auth: none, so the
-  # voice network policy auto-allows them (no per-turn approval prompts).
+  # Voice provider: STT + TTS as SLOP affordances, both served by the Spark.
   voice:
     enabled: true
     stt:
       endpoints:
-        parakeet:
-          protocol: openai-transcriptions
-          baseUrl: http://localhost:8090/v1
+        # Nemotron 3.5 ASR streaming on the Spark (nemotron-asr-streaming-api):
+        # server-side VAD, streaming partials, OpenAI GA transcription dialect.
+        # 16 kHz PCM16 mono — the rate the FastConformer expects.
+        nemotron-spark:
+          protocol: realtime-stt
+          dialect: openai
+          baseUrl: ws://192.168.1.96:8002/v1/realtime
           auth:
             type: none
+          sampleRate: 16000
           models:
-            parakeet-tdt: {}
+            nvidia/nemotron-3.5-asr-streaming-0.6b: {}
       profiles:
-        - id: stt-parakeet
-          label: Parakeet TDT (mlx)
-          endpointId: parakeet
-          model: parakeet-tdt
-          language: en
-      defaultProfileId: stt-parakeet
+        - id: stt-nemotron
+          label: Nemotron 3.5 ASR (spark)
+          endpointId: nemotron-spark
+          model: nvidia/nemotron-3.5-asr-streaming-0.6b
+      defaultProfileId: stt-nemotron
     tts:
       endpoints:
+        # Voxtral TTS via vLLM-Omni on the Spark, direct (no gateway proxy).
+        # Streams 24 kHz PCM from /v1/audio/speech.
         voxtral:
           protocol: openai-speech
-          baseUrl: http://localhost:8090/v1 # gateway proxies /audio/speech to the spark
+          baseUrl: http://192.168.1.96:8091/v1
           auth:
             type: none
           model: mistralai/Voxtral-4B-TTS-2603
+          pcmSampleRate: 24000
       profiles:
         - id: tts-voxtral
           label: Voxtral (spark)
@@ -117,7 +147,7 @@ plugins:
       enabled: true
       providerId: reachy
     realtime:
-      autoStartMode: continuous # hands-free from boot; both speech endpoints are local
+      autoStartMode: continuous # hands-free from boot; Spark endpoints need one TUI approval
       defaultStartMode: continuous
 
 session:
