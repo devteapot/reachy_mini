@@ -105,6 +105,7 @@ DAEMON_API_BASE = "http://localhost:8000/api"
 DAEMON_STATUS_URL = f"{DAEMON_API_BASE}/daemon/status"
 POLL_INTERVAL_S = 0.2  # ~5 Hz state poll
 VOLUME_POLL_EVERY = 25  # poll volume every Nth state poll (~5 s) — it rarely changes
+DEFAULT_INITIAL_VOLUME = 100  # speaker volume applied at startup (host-configurable)
 JOINT_ROUNDING = 4  # decimals — stabilises float jitter so we don't emit constant patches
 
 # Camera captures: JPEGs written to a small ring on disk; the consumer resolves
@@ -1048,6 +1049,7 @@ async def run(
     listen_mode: str = "wake",
     audio_router_enabled: bool = True,
     router_config: AudioRouterConfig | None = None,
+    initial_volume: int | None = DEFAULT_INITIAL_VOLUME,
 ) -> None:
     logger.info("connecting to Reachy Mini daemon (media_backend=%s)...", media_backend)
     try:
@@ -1078,6 +1080,15 @@ async def run(
     state.mode = await asyncio.to_thread(fetch_daemon_mode)
     state.power_state = initial_state
     state.listen_mode = listen_mode
+    if initial_volume is not None:
+        # Before the wake-up emote, so it already plays at this level. Quiet on
+        # failure — the volume API is down exactly when the daemon is, and the
+        # joint poll reports that.
+        try:
+            await asyncio.to_thread(_daemon_post, "/volume/set", {"volume": initial_volume})
+            logger.info("initial speaker volume set to %d", initial_volume)
+        except Exception:
+            logger.warning("could not set initial volume to %d", initial_volume, exc_info=True)
     await asyncio.to_thread(fetch_volumes, state)
     logger.info(
         "mode=%s audio=%s camera=%s volume=%s",
@@ -1223,6 +1234,17 @@ def main() -> None:
         help="Mic routing while live: gated behind the wake word, or open mic.",
     )
     parser.add_argument(
+        "--initial-volume",
+        type=int,
+        default=DEFAULT_INITIAL_VOLUME,
+        metavar="0-100",
+        help=(
+            "Speaker volume applied at startup through the daemon, before the "
+            "wake-up emote (default %(default)s). Pass a negative value to keep "
+            "the daemon's current volume."
+        ),
+    )
+    parser.add_argument(
         "--audio-router",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1263,6 +1285,8 @@ def main() -> None:
         help="RMS voice-activity threshold used to detect end of speech.",
     )
     args = parser.parse_args()
+    if args.initial_volume > 100:
+        parser.error("--initial-volume must be 0-100 (or negative to keep the current volume)")
     router_config = AudioRouterConfig(
         socket_path=args.audio_socket,
         wake_model=args.wake_model,
@@ -1282,6 +1306,7 @@ def main() -> None:
             listen_mode=args.listen_mode,
             audio_router_enabled=args.audio_router,
             router_config=router_config,
+            initial_volume=args.initial_volume if args.initial_volume >= 0 else None,
         )
     )
 

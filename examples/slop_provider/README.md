@@ -45,6 +45,10 @@ sloppy (TS SLOP consumer)
   daemon's REST volume API; current values are polled into `/audio` props every
   ~5 s so out-of-band changes show up too. `test_sound` plays a short sound
   through the provider's own audio path (the same one emotions use).
+  On startup the provider sets the speaker volume to 100 (before the wake-up
+  emote, so it plays at that level); the host launching the provider picks the
+  value with `--initial-volume 0-100`, or keeps the daemon's current volume by
+  passing a negative value.
 - `list_emotions` / `play_emotion(name)` — default recorded emotions from
   `pollen-robotics/reachy-mini-emotions-library`. The first call may cache the
   dataset from Hugging Face. The move's bundled sound plays on the robot speaker
