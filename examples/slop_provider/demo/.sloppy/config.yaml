@@ -26,7 +26,7 @@ llm:
     spark:
       label: Spark Qwen3.6 brain
       protocol: openai-chat
-      baseUrl: http://192.168.1.96:8000/v1
+      baseUrl: http://192.168.1.103:8000/v1
       auth:
         type: none
       models:
@@ -98,7 +98,7 @@ plugins:
         nemotron-spark:
           protocol: realtime-stt
           dialect: openai
-          baseUrl: ws://192.168.1.96:8002/v1/realtime
+          baseUrl: ws://192.168.1.103:8002/v1/realtime
           auth:
             type: none
           sampleRate: 16000
@@ -116,7 +116,7 @@ plugins:
         # Streams 24 kHz PCM from /v1/audio/speech.
         voxtral:
           protocol: openai-speech
-          baseUrl: http://192.168.1.96:8091/v1
+          baseUrl: http://192.168.1.103:8091/v1
           auth:
             type: none
           model: mistralai/Voxtral-4B-TTS-2603
