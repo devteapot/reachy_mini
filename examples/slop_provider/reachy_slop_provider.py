@@ -23,7 +23,8 @@ State tree::
     │               power_state, listen_mode, wake_word_active, audio_gate_open,
     │               head_joints, antenna_joints  (live, polled)
     ├── /head       actions: goto_pose, set_pose, set_antennas
-    ├── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
+    ├── /behavior   props: emotions (move names, prefetched at startup)
+    │               actions: wake_up, goto_sleep, list_emotions, play_emotion,
     │               enable_wobbling, disable_wobbling, stop (visible while busy)
     ├── /audio      props: available, volume, microphone_volume  (polled ~5 s)
     │               actions: set_volume, set_microphone_volume, test_sound,
@@ -180,6 +181,9 @@ class RobotState:
         # captured_at). Not in snapshot_key(): only capture_frame changes it, and
         # that action calls slop.refresh() itself.
         self.last_capture: dict[str, Any] | None = None
+        # Emotion move names, filled once by the startup prefetch (None until
+        # loaded). Not in snapshot_key(): prefetch_emotions refreshes explicitly.
+        self.emotions: list[str] | None = None
         self.busy_action: str | None = None  # name of the in-flight long motion, if any
         self.power_state: str = "live"  # "live" | "sleep" — drives motion guards + mic gating
         self.listen_mode: str = "wake"  # "realtime" | "wake" — mic routing while live
@@ -209,11 +213,14 @@ class RobotState:
 
 
 def build_server(
-    mini: ReachyMini, state: RobotState, router: AudioRouter | None = None
+    mini: ReachyMini,
+    state: RobotState,
+    router: AudioRouter | None = None,
+    emotions: RecordedMoveLibrary | None = None,
 ) -> SlopServer:
     """Construct the SLOP server: nodes read the cache, actions drive the robot."""
     slop = SlopServer("reachy", "Reachy Mini")
-    emotions = RecordedMoveLibrary(DEFAULT_EMOTIONS_DATASET)
+    emotions = emotions or RecordedMoveLibrary(DEFAULT_EMOTIONS_DATASET)
     background_tasks: set[asyncio.Task] = set()
 
     # --- Busy / conflict policy ---------------------------------------------------
@@ -412,9 +419,13 @@ def build_server(
                 "High-level behaviors: wake_up and goto_sleep emotes, default recorded "
                 "emotion moves, and audio-reactive head wobbling (visible motion only "
                 "when audio is playing). After goto_sleep, motor torque is off — head "
-                "and antenna commands will not move the robot until wake_up."
+                "and antenna commands will not move the robot until wake_up. "
+                "Available emotion names are listed in props.emotions once loaded; "
+                "play_emotion accepts an optional boolean sound param (default true)."
             ),
         }
+        if state.emotions is not None:
+            desc["props"] = {"emotions": state.emotions}
         if state.busy_action is not None:
             # While a motion plays: only non-motion actions, plus stop to cancel it.
             desc["actions"] = {
@@ -596,6 +607,8 @@ def build_server(
         moves = await asyncio.to_thread(emotions.list_moves)
         return {"ok": True, "dataset": emotions.dataset_name, "emotions": moves}
 
+    # sound is intentionally NOT in the params schema — slop_ai marks every
+    # declared param as required (same constraint as capture_frame's max_width).
     @slop.action(
         "behavior",
         "play_emotion",
@@ -609,13 +622,15 @@ def build_server(
         description=(
             "Play one recorded move from the default Reachy Mini emotions library. "
             "The robot first moves to the recording's initial pose over 1 second; "
-            "the move's bundled sound plays when status.audio is true. "
+            "the move's bundled sound plays when status.audio is true. Accepts an "
+            "optional boolean param sound (default true) — pass false to play the "
+            "motion silently, e.g. while other audio is speaking. "
             "Returns 'accepted' and plays in the background — cancel with stop, "
             "watch status.busy / the action-finished event."
         ),
         estimate="async",
     )
-    async def play_emotion(name: str) -> dict[str, Any]:
+    async def play_emotion(name: str, sound: bool = True) -> dict[str, Any]:
         ensure_awake("play_emotion")
         ensure_not_busy("play_emotion")  # fail fast before the (possibly slow) validation
         library = await asyncio.to_thread(emotions.load)
@@ -626,12 +641,13 @@ def build_server(
                 f"Unknown emotion {name!r}. Available emotions: {', '.join(available)}",
             )
         move = await asyncio.to_thread(library.get, name)
+        effective_sound = bool(sound) and state.audio
 
         async def work() -> None:
-            await mini.async_play_move(move, initial_goto_duration=1.0, sound=state.audio)
+            await mini.async_play_move(move, initial_goto_duration=1.0, sound=effective_sound)
 
         result = start_motion("play_emotion", work)
-        result.update({"emotion": name, "dataset": emotions.dataset_name})
+        result.update({"emotion": name, "dataset": emotions.dataset_name, "sound": effective_sound})
         return result
 
     @slop.action(
@@ -844,6 +860,29 @@ def build_server(
     slop.node("camera")(camera_node)
 
     return slop
+
+
+async def prefetch_emotions(
+    emotions: RecordedMoveLibrary, state: RobotState, slop: SlopServer
+) -> None:
+    """Warm the emotions dataset and publish the move names as /behavior props.
+
+    Loading the HF dataset is slow on first run (download) — doing it at startup
+    means the first play_emotion doesn't stall, and the LLM sees the emotion
+    vocabulary in the state tree without a list_emotions round trip. Quiet on
+    failure (e.g. offline with a cold cache): props.emotions stays absent and
+    play_emotion still validates names on invoke.
+    """
+    try:
+        names = await asyncio.to_thread(emotions.list_moves)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("emotions prefetch failed — props.emotions unavailable", exc_info=True)
+        return
+    state.emotions = names
+    slop.refresh()
+    logger.info("emotions prefetched: %d moves", len(names))
 
 
 async def poll_state(
@@ -1111,7 +1150,8 @@ async def run(
     elif audio_router_enabled:
         logger.warning("audio backend unavailable — mic routing and wake word disabled")
 
-    slop = build_server(mini, state, router)
+    emotions = RecordedMoveLibrary(DEFAULT_EMOTIONS_DATASET)
+    slop = build_server(mini, state, router, emotions)
 
     if router is not None:
         initial_mode = (
@@ -1144,6 +1184,7 @@ async def run(
     logger.info("SLOP provider listening on unix:%s (mode=%s)", socket_path, state.mode)
 
     poll_task = asyncio.create_task(poll_state(mini, state, slop, router))
+    prefetch_task = asyncio.create_task(prefetch_emotions(emotions, state, slop))
 
     # Shut down cleanly on SIGINT/SIGTERM.
     stop = asyncio.Event()
@@ -1175,11 +1216,12 @@ async def run(
                 await asyncio.to_thread(mini.disable_motors)
             except Exception:
                 logger.warning("goto-sleep on exit failed", exc_info=True)
-        poll_task.cancel()
-        try:
-            await poll_task
-        except asyncio.CancelledError:
-            pass
+        for task in (poll_task, prefetch_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         server.close()
         await server.wait_closed()
         slop.stop()

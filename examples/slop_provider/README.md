@@ -27,7 +27,8 @@ sloppy (TS SLOP consumer)
 │               head_joints, antenna_joints                            (live, ~5 Hz)
 ├── /head       actions: goto_pose(pitch,roll,yaw,z,duration),
 │               set_pose(pitch,roll,yaw,z), set_antennas(right,left)
-├── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
+├── /behavior   props: emotions (move names, prefetched at startup)
+│               actions: wake_up, goto_sleep, list_emotions, play_emotion,
 │               enable_wobbling, disable_wobbling, stop (visible while busy)
 ├── /audio      props: available, volume, microphone_volume           (polled ~5 s)
 │               actions: set_volume(volume), set_microphone_volume(volume),
@@ -49,10 +50,14 @@ sloppy (TS SLOP consumer)
   emote, so it plays at that level); the host launching the provider picks the
   value with `--initial-volume 0-100`, or keeps the daemon's current volume by
   passing a negative value.
-- `list_emotions` / `play_emotion(name)` — default recorded emotions from
-  `pollen-robotics/reachy-mini-emotions-library`. The first call may cache the
-  dataset from Hugging Face. The move's bundled sound plays on the robot speaker
-  when `/status.audio` is true (default `--media-backend local`).
+- `list_emotions` / `play_emotion(name, sound?)` — default recorded emotions from
+  `pollen-robotics/reachy-mini-emotions-library`. The provider prefetches the
+  dataset at startup (background task) and publishes the move names as
+  `/behavior` `props.emotions`, so consumers see the vocabulary without a
+  round trip and the first `play_emotion` doesn't stall on a download. The
+  move's bundled sound plays on the robot speaker when `/status.audio` is true
+  (default `--media-backend local`); pass the optional `sound: false` param to
+  play the motion silently (e.g. while TTS speech is using the speaker).
 
 **Async motion + busy state.** Long motions (`goto_pose`, `wake_up`, `goto_sleep`,
 `play_emotion`) follow the SLOP async-actions extension: the invoke returns

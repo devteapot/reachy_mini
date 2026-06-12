@@ -102,6 +102,26 @@ class FakeMini:
         self.calls.append(("disable_wobbling",))
 
 
+class FakeMove:
+    def __init__(self, name: str) -> None:
+        self.description = name
+
+
+class FakeMoveLibrary:
+    """Duck-typed RecordedMoveLibrary: no HF download, fixed move names."""
+
+    dataset_name = "fake/emotions"
+
+    def load(self):
+        return self
+
+    def list_moves(self):
+        return ["fake1", "fake2"]
+
+    def get(self, name: str) -> FakeMove:
+        return FakeMove(name)
+
+
 def build_stub():
     mini = FakeMini()
     state = rsp.RobotState()
@@ -109,6 +129,7 @@ def build_stub():
     # bypasses run(), so mirror it here (FakeMedia.get_frame serves the frames).
     state.camera = rsp.PILImage is not None
     state.camera_resolution = [1280, 720]
+    state.audio = True  # so play_emotion's `sound and state.audio` is observable
     rsp.DEFAULT_FRAMES_DIR = FRAMES_DIR  # capture_frame reads this at call time
     detector = FakeDetector()
     router = AudioRouter(
@@ -117,13 +138,14 @@ def build_stub():
         allow_wake=lambda: state.busy_action not in ("goto_sleep", "wake_up"),
         detector=detector,
     )
-    slop = rsp.build_server(mini, state, router)
-    return mini, state, detector, router, slop
+    emotions = FakeMoveLibrary()
+    slop = rsp.build_server(mini, state, router, emotions)
+    return mini, state, detector, router, slop, emotions
 
 
 async def serve() -> None:
     """Serve for 20 s so an external (TypeScript) consumer can poke the tree."""
-    mini, state, detector, router, slop = build_stub()
+    mini, state, detector, router, slop, _emotions = build_stub()
     server = await rsp.listen_unix(slop, SOCKET)
     rsp.write_descriptor(DESCRIPTOR, SOCKET)
     await router.start(RouterMode.WAKE)
@@ -163,7 +185,7 @@ async def check() -> None:
     from slop_ai import SlopConsumer
     from slop_ai.transports.unix_client import UnixClientTransport
 
-    mini, state, detector, router, slop = build_stub()
+    mini, state, detector, router, slop, emotions = build_stub()
     server = await rsp.listen_unix(slop, SOCKET)
     await router.start(RouterMode.WAKE)
     poll = asyncio.create_task(rsp.poll_state(mini, state, slop, router))
@@ -192,6 +214,53 @@ async def check() -> None:
         ok("goto_sleep offered while live", "goto_sleep" in affordance_names(behavior))
         audio = await consumer.query("/audio")
         ok("set_listen_mode offered with router", "set_listen_mode" in affordance_names(audio))
+
+        # --- emotions: prefetch props, play_emotion sound param, conflicts ------
+        ok("no emotions prop before prefetch", "emotions" not in (behavior.properties or {}))
+        await rsp.prefetch_emotions(emotions, state, slop)
+        behavior = await consumer.query("/behavior")
+        ok(
+            "emotions prop after prefetch",
+            behavior.properties.get("emotions") == ["fake1", "fake2"],
+            str(behavior.properties),
+        )
+
+        res = await consumer.invoke("/behavior", "play_emotion", {"name": "fake1"})
+        ok("play_emotion accepted", res.get("status") == "accepted", str(res))
+        ok("play_emotion result reports sound", res.get("data", {}).get("sound") is True, str(res))
+        await wait_for(lambda: state.busy_action is None, what="emotion to finish")
+        ok("emotion played with sound by default", ("async_play_move", "fake1", 1.0, True) in mini.calls)
+        await wait_for(lambda: "action-finished" in event_names(), what="action-finished event")
+
+        res = await consumer.invoke("/behavior", "play_emotion", {"name": "fake1", "sound": False})
+        ok("muted play_emotion accepted", res.get("status") == "accepted", str(res))
+        await wait_for(lambda: state.busy_action is None, what="muted emotion to finish")
+        ok("sound=false muted the move", ("async_play_move", "fake1", 1.0, False) in mini.calls)
+
+        res = await consumer.invoke("/behavior", "play_emotion", {"name": "nope"})
+        ok(
+            "unknown emotion rejected",
+            res.get("status") == "error" and res.get("error", {}).get("code") == "invalid_params",
+            str(res),
+        )
+
+        res = await consumer.invoke("/behavior", "play_emotion", {"name": "fake2"})
+        ok("first of two emotions accepted", res.get("status") == "accepted", str(res))
+        # While busy, play_emotion is hidden from the descriptor, so slop_ai
+        # rejects a second invoke before the provider's conflict guard runs.
+        res = await consumer.invoke("/behavior", "play_emotion", {"name": "fake1"})
+        ok("second emotion rejected while busy", res.get("status") == "error", str(res))
+        # Head affordances stay visible while busy — those hit the conflict guard.
+        res = await consumer.invoke("/head", "set_pose", {"pitch": 0, "roll": 0, "yaw": 0, "z": 0})
+        ok(
+            "set_pose conflicts while emotion plays",
+            res.get("status") == "error" and res.get("error", {}).get("code") == "conflict",
+            str(res),
+        )
+        behavior = await consumer.query("/behavior")
+        names = affordance_names(behavior)
+        ok("busy: stop offered, play_emotion hidden", "stop" in names and "play_emotion" not in names)
+        await wait_for(lambda: state.busy_action is None, what="conflicting emotion to finish")
 
         # --- camera: capture, content_ref, ring pruning -------------------------
         if rsp.PILImage is None:
