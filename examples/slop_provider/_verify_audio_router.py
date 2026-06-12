@@ -115,6 +115,15 @@ class FakeMedia:
             self._chunks.append(stereo[:cut])
             self._chunks.append(stereo[cut:])
 
+    def get_frame(self) -> np.ndarray:
+        """Synthetic 1280x720 BGR gradient, like the SDK MediaManager's get_frame."""
+        h, w = 720, 1280
+        frame = np.empty((h, w, 3), dtype=np.uint8)
+        frame[:, :, 0] = np.linspace(0, 255, w, dtype=np.uint8)[None, :]
+        frame[:, :, 1] = np.linspace(0, 255, h, dtype=np.uint8)[:, None]
+        frame[:, :, 2] = 128
+        return frame
+
 
 class FakeDetector:
     """Scripted scores; `arm(score)` makes the next fed frame detect."""

@@ -25,9 +25,12 @@ State tree::
     ├── /head       actions: goto_pose, set_pose, set_antennas
     ├── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
     │               enable_wobbling, disable_wobbling, stop (visible while busy)
-    └── /audio      props: available, volume, microphone_volume  (polled ~5 s)
-                    actions: set_volume, set_microphone_volume, test_sound,
-                    set_listen_mode
+    ├── /audio      props: available, volume, microphone_volume  (polled ~5 s)
+    │               actions: set_volume, set_microphone_volume, test_sound,
+    │               set_listen_mode
+    └── /camera     props: available, resolution, last capture metadata
+                    actions: capture_frame — result carries a content_ref
+                    (file:// JPEG); rejected while asleep
 
 Power states (see ``audio_router.py`` for the microphone side):
 
@@ -58,14 +61,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import os
 import signal
 import threading
+import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+import numpy as np
+
+try:  # camera capture needs Pillow for JPEG encode + downscale (see README)
+    from PIL import Image as PILImage
+except ImportError:  # pragma: no cover — capture degrades to unavailable
+    PILImage = None
 
 from reachy_mini import ReachyMini
 from reachy_mini.motion.recorded_move import RecordedMoves
@@ -93,6 +106,16 @@ DAEMON_STATUS_URL = f"{DAEMON_API_BASE}/daemon/status"
 POLL_INTERVAL_S = 0.2  # ~5 Hz state poll
 VOLUME_POLL_EVERY = 25  # poll volume every Nth state poll (~5 s) — it rarely changes
 JOINT_ROUNDING = 4  # decimals — stabilises float jitter so we don't emit constant patches
+
+# Camera captures: JPEGs written to a small ring on disk; the consumer resolves
+# the returned file:// content_ref (provider and sloppy share the host).
+DEFAULT_FRAMES_DIR = "/tmp/slop/camera"
+FRAME_RING_SIZE = 8
+CAPTURE_MAX_DIM_DEFAULT = 800  # px — plenty for a vision model, cheap to encode
+CAPTURE_MAX_DIM_RANGE = (64, 1600)
+CAPTURE_JPEG_QUALITY = 80
+CAPTURE_READ_ATTEMPTS = 3  # GStreamerCamera.read() returns None on appsink timeout
+CAPTURE_READ_RETRY_S = 0.2
 
 # Must mirror the hello message sent by slop_ai's SlopServer.handle_connection,
 # so discovery and handshake advertise the same surface.
@@ -150,6 +173,12 @@ class RobotState:
         self.connected: bool = False
         self.mode: str = "unknown"  # "sim" | "real" | "unknown" (from the daemon status API)
         self.audio: bool = False  # whether the SDK client has a working audio backend
+        self.camera: bool = False  # camera backend AND Pillow both available
+        self.camera_resolution: list[int] | None = None  # [width, height] px
+        # Metadata of the newest captured frame (path, width, height, size_bytes,
+        # captured_at). Not in snapshot_key(): only capture_frame changes it, and
+        # that action calls slop.refresh() itself.
+        self.last_capture: dict[str, Any] | None = None
         self.busy_action: str | None = None  # name of the in-flight long motion, if any
         self.power_state: str = "live"  # "live" | "sleep" — drives motion guards + mic gating
         self.listen_mode: str = "wake"  # "realtime" | "wake" — mic routing while live
@@ -211,6 +240,25 @@ def build_server(
                 f"Robot is asleep (motor torque off) — {action} is unavailable. "
                 "Invoke the behavior 'wake_up' affordance first.",
             )
+
+    def ensure_camera(action: str) -> None:
+        if not state.camera:
+            raise SlopActionError(
+                "conflict",
+                "Camera is unavailable (no media backend camera, or Pillow is "
+                "not installed in the provider environment).",
+            )
+        if state.power_state == "sleep":
+            # Same policy as the muted microphone: asleep means deaf AND blind.
+            raise SlopActionError(
+                "conflict",
+                f"Robot is asleep — {action} is unavailable. "
+                "Invoke the behavior 'wake_up' affordance first.",
+            )
+
+    # The camera appsink keeps a single buffer (drop=true, max-buffers=1):
+    # concurrent reads race for it and one gets None. Serialize captures.
+    capture_lock = asyncio.Lock()
 
     def start_motion(name: str, work_factory: Callable[[], Awaitable[None]]) -> dict[str, Any]:
         ensure_not_busy(name)
@@ -721,11 +769,78 @@ def build_server(
         slop.refresh()
         return {"ok": True, "listen_mode": mode, "power_state": state.power_state}
 
+    # --- Camera node + capture (frames from the daemon's local video tee) -------
+
+    def camera_node() -> dict[str, Any]:
+        # No node-level content_ref: the capture_frame RESULT carries the
+        # file:// ref (the consumer ingests it from there); a ref on the node
+        # would dangle once the ring prunes the file and would tempt the
+        # model with a URI it cannot fetch.
+        cap = state.last_capture
+        return {
+            "type": "sensor",
+            "props": {
+                "available": state.camera,
+                "resolution": state.camera_resolution,
+                "last_capture_at": cap["captured_at"] if cap else None,
+                "last_capture_size": [cap["width"], cap["height"]] if cap else None,
+            },
+            "summary": (
+                "Robot head camera. Invoke capture_frame to take a still photo: "
+                "the result carries a content_ref with a file:// URI to a JPEG "
+                "on the shared host. Capture is rejected while the robot is "
+                "asleep — wake_up first."
+            ),
+            # capture_frame stays visible while asleep/unavailable (the SDK's
+            # descriptor/decorator merge cannot express an empty action set —
+            # same constraint as head_node); invokes are rejected with
+            # "conflict" by ensure_camera instead.
+        }
+
+    # max_width is intentionally NOT in the params schema: slop_ai marks every
+    # declared param as required (descriptor._normalize_params), and optional
+    # params aren't expressible. Undeclared invoke params still reach the
+    # handler (server._wrap_handler filters by signature).
+    @slop.action(
+        "camera",
+        "capture_frame",
+        label="Capture camera frame",
+        description=(
+            "Take a still photo with the head camera. Returns frame metadata "
+            "plus a content_ref whose file:// URI points at the JPEG. Accepts "
+            "an optional integer param max_width — largest output dimension in "
+            f"px ({CAPTURE_MAX_DIM_RANGE[0]}-{CAPTURE_MAX_DIM_RANGE[1]}, "
+            f"default {CAPTURE_MAX_DIM_DEFAULT}; never upscales)."
+        ),
+        estimate="fast",
+    )
+    async def capture_frame(max_width: int | None = None) -> dict[str, Any]:
+        ensure_camera("capture_frame")
+        max_dim = CAPTURE_MAX_DIM_DEFAULT if max_width is None else int(max_width)
+        lo, hi = CAPTURE_MAX_DIM_RANGE
+        if not lo <= max_dim <= hi:
+            raise SlopActionError("invalid_params", f"max_width must be between {lo} and {hi}")
+        async with capture_lock:
+            # DEFAULT_FRAMES_DIR resolved at call time so test scaffolds can
+            # point the ring at a scratch directory.
+            cap = await asyncio.to_thread(_capture_and_store, mini, max_dim, DEFAULT_FRAMES_DIR)
+        state.last_capture = cap
+        slop.refresh()
+        return {
+            "ok": True,
+            "width": cap["width"],
+            "height": cap["height"],
+            "size_bytes": cap["size_bytes"],
+            "captured_at": cap["captured_at"],
+            "content_ref": _capture_content_ref(cap),
+        }
+
     # Register nodes last — see the comment above status_node.
     slop.node("status")(status_node)
     slop.node("head")(head_node)
     slop.node("behavior")(behavior_node)
     slop.node("audio")(audio_node)
+    slop.node("camera")(camera_node)
 
     return slop
 
@@ -810,6 +925,87 @@ def fetch_volumes(state: RobotState) -> None:
             setattr(state, attr, None)
 
 
+def _encode_jpeg(frame: np.ndarray, max_dim: int) -> tuple[bytes, int, int]:
+    """JPEG-encode a BGR frame, downscaled to fit max_dim. Blocking — to_thread.
+
+    Returns ``(jpeg_bytes, width, height)`` of the encoded image.
+    """
+    img = PILImage.fromarray(frame[:, :, ::-1])  # BGR -> RGB; fromarray copies
+    img.thumbnail((max_dim, max_dim))  # aspect-preserving, never upscales
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=CAPTURE_JPEG_QUALITY)
+    return buf.getvalue(), img.width, img.height
+
+
+def _store_frame(data: bytes, frames_dir: str) -> Path:
+    """Write a frame to the ring dir with the descriptor's filesystem hardening.
+
+    0700 dir, 0600 file, atomic same-directory temp + rename. Timestamped names
+    keep ring pruning a filename sort.
+    """
+    dir_path = Path(frames_dir)
+    dir_path.mkdir(parents=True, exist_ok=True)
+    os.chmod(dir_path, 0o700)
+    final_path = dir_path / f"frame-{int(time.time() * 1000)}.jpg"
+    tmp_path = dir_path / f"{final_path.name}.tmp.{os.getpid()}"
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, final_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return final_path
+
+
+def _prune_frames(frames_dir: str, keep: int = FRAME_RING_SIZE) -> None:
+    frames = sorted(Path(frames_dir).glob("frame-*.jpg"))
+    for old in frames[:-keep] if keep else frames:
+        old.unlink(missing_ok=True)
+
+
+def _capture_and_store(
+    mini: ReachyMini, max_dim: int, frames_dir: str = DEFAULT_FRAMES_DIR
+) -> dict[str, Any]:
+    """Grab a frame, encode, store, prune. Blocking — call via to_thread.
+
+    Returns the ``last_capture`` metadata dict.
+    """
+    frame = None
+    for attempt in range(CAPTURE_READ_ATTEMPTS):
+        frame = mini.media.get_frame()
+        if frame is not None:
+            break
+        if attempt + 1 < CAPTURE_READ_ATTEMPTS:
+            time.sleep(CAPTURE_READ_RETRY_S)  # appsink timeout is transient
+    if frame is None:
+        raise RuntimeError("no frame from camera (daemon video tee not delivering)")
+    data, width, height = _encode_jpeg(frame, max_dim)
+    path = _store_frame(data, frames_dir)
+    _prune_frames(frames_dir)
+    return {
+        "path": str(path),
+        "width": width,
+        "height": height,
+        "size_bytes": len(data),
+        "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def _capture_content_ref(cap: dict[str, Any]) -> dict[str, Any]:
+    """content_ref dict (spec §13) for a capture — used by node and action result."""
+    return {
+        "type": "binary",
+        "mime": "image/jpeg",
+        "summary": (
+            f"Camera frame {cap['width']}x{cap['height']}, captured at {cap['captured_at']}"
+        ),
+        "size": cap["size_bytes"],
+        "uri": f"file://{cap['path']}",
+    }
+
+
 def write_descriptor(path: str, socket_path: str) -> None:
     """Write the discovery descriptor per spec/core/transport.md §Local discovery.
 
@@ -870,11 +1066,26 @@ async def run(
 
     state = RobotState()
     state.audio = getattr(mini.media_manager, "audio", None) is not None
+    camera = getattr(mini.media_manager, "camera", None)
+    state.camera = camera is not None and PILImage is not None
+    if camera is not None:
+        state.camera_resolution = [int(v) for v in camera.resolution]
+        if PILImage is None:
+            logger.warning(
+                "camera backend is up but Pillow is missing — capture_frame "
+                "disabled. Install it with: uv pip install pillow"
+            )
     state.mode = await asyncio.to_thread(fetch_daemon_mode)
     state.power_state = initial_state
     state.listen_mode = listen_mode
     await asyncio.to_thread(fetch_volumes, state)
-    logger.info("mode=%s audio=%s volume=%s", state.mode, state.audio, state.volume)
+    logger.info(
+        "mode=%s audio=%s camera=%s volume=%s",
+        state.mode,
+        state.audio,
+        state.camera,
+        state.volume,
+    )
 
     router: AudioRouter | None = None
     if audio_router_enabled and state.audio:

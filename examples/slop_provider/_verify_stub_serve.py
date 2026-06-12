@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -37,6 +38,7 @@ from audio_router import AudioRouter, AudioRouterConfig, RouterMode  # noqa: E40
 SOCKET = "/tmp/slop/reachy.sock"
 DESCRIPTOR = "/tmp/slop/providers/reachy.json"
 AUDIO_SOCKET = "/tmp/slop/_verify_reachy_audio.sock"
+FRAMES_DIR = "/tmp/slop/_verify_camera_frames"  # scratch ring, not the real one
 
 
 class FakeMini:
@@ -103,6 +105,11 @@ class FakeMini:
 def build_stub():
     mini = FakeMini()
     state = rsp.RobotState()
+    # The real provider sets these in run() from the SDK media manager; the stub
+    # bypasses run(), so mirror it here (FakeMedia.get_frame serves the frames).
+    state.camera = rsp.PILImage is not None
+    state.camera_resolution = [1280, 720]
+    rsp.DEFAULT_FRAMES_DIR = FRAMES_DIR  # capture_frame reads this at call time
     detector = FakeDetector()
     router = AudioRouter(
         mini.media,
@@ -186,6 +193,46 @@ async def check() -> None:
         audio = await consumer.query("/audio")
         ok("set_listen_mode offered with router", "set_listen_mode" in affordance_names(audio))
 
+        # --- camera: capture, content_ref, ring pruning -------------------------
+        if rsp.PILImage is None:
+            print("[stub] Pillow not installed — skipping camera checks", flush=True)
+        else:
+            shutil.rmtree(FRAMES_DIR, ignore_errors=True)
+            camera = await consumer.query("/camera")
+            ok("camera available, no capture yet", camera.properties["available"] is True)
+            ok("capture_frame offered while live", "capture_frame" in affordance_names(camera))
+
+            res = await consumer.invoke("/camera", "capture_frame")
+            cap = res.get("data", {})
+            ok("capture_frame ok", res.get("status") == "ok" and cap.get("ok") is True, str(res))
+            ok("capture downscaled to default", cap["width"] <= 800 and cap["height"] <= 800)
+            frame_path = Path(cap["content_ref"]["uri"].removeprefix("file://"))
+            ok("frame file exists 0600", frame_path.is_file() and (frame_path.stat().st_mode & 0o777) == 0o600)
+            ok("frame is a JPEG", frame_path.read_bytes()[:2] == b"\xff\xd8")
+            ok("content_ref size matches file", cap["content_ref"]["size"] == frame_path.stat().st_size)
+
+            camera = await consumer.query("/camera")
+            ok(
+                "node shows capture metadata but no content_ref",
+                # The ref lives only in the action result: a node-level ref
+                # would dangle once the ring prunes the file.
+                camera.content_ref is None
+                and camera.properties["last_capture_at"] == cap["captured_at"]
+                and camera.properties["last_capture_size"] == [cap["width"], cap["height"]],
+            )
+
+            res = await consumer.invoke("/camera", "capture_frame", {"max_width": 32})
+            ok(
+                "invalid max_width rejected",
+                res.get("status") == "error" and res.get("error", {}).get("code") == "invalid_params",
+                str(res),
+            )
+
+            for _ in range(10):
+                await consumer.invoke("/camera", "capture_frame", {"max_width": 200})
+            n_frames = len(list(Path(FRAMES_DIR).glob("frame-*.jpg")))
+            ok("frame ring pruned", n_frames <= rsp.FRAME_RING_SIZE, f"{n_frames} files")
+
         # --- goto_sleep: mutes the mic, hides motion, rejects motion invokes ----
         res = await consumer.invoke("/behavior", "goto_sleep")
         ok("goto_sleep accepted", res.get("status") == "accepted", str(res))
@@ -205,6 +252,16 @@ async def check() -> None:
             res.get("status") == "error" and res.get("error", {}).get("code") == "conflict",
             str(res),
         )
+
+        if rsp.PILImage is not None:
+            # capture_frame stays visible while asleep (empty action sets are
+            # inexpressible — see camera_node); the invoke must conflict.
+            res = await consumer.invoke("/camera", "capture_frame")
+            ok(
+                "capture rejected while asleep",
+                res.get("status") == "error" and res.get("error", {}).get("code") == "conflict",
+                str(res),
+            )
 
         # --- voice wake from sleep ------------------------------------------------
         detector.arm(0.9)

@@ -29,9 +29,12 @@ sloppy (TS SLOP consumer)
 │               set_pose(pitch,roll,yaw,z), set_antennas(right,left)
 ├── /behavior   actions: wake_up, goto_sleep, list_emotions, play_emotion,
 │               enable_wobbling, disable_wobbling, stop (visible while busy)
-└── /audio      props: available, volume, microphone_volume           (polled ~5 s)
-                actions: set_volume(volume), set_microphone_volume(volume),
-                test_sound, set_listen_mode(mode)
+├── /audio      props: available, volume, microphone_volume           (polled ~5 s)
+│               actions: set_volume(volume), set_microphone_volume(volume),
+│               test_sound, set_listen_mode(mode)
+└── /camera     props: available, resolution, last_capture_at, last_capture_size
+                actions: capture_frame(max_width?) — the result carries a
+                content_ref with a file:// URI to the JPEG
 ```
 
 - `goto_pose` — head orientation in **degrees** (+pitch looks **down**, +roll tilts
@@ -77,6 +80,24 @@ Detection runs locally via [openWakeWord](https://github.com/dscripka/openWakeWo
 (`--wake-model`, default `hey_jarvis`; pass a path to a custom `.onnx` for your
 own phrase). Events: `wake-word-detected`, `power-state-changed`.
 
+**Camera.** `capture_frame` grabs a still from the daemon's local video tee
+(the same `GStreamerCamera` IPC path the SDK's `local` media backend uses — no
+WebRTC decode, no contention with the daemon's own WebRTC stream), downsizes it
+to `max_width` px (optional, 64-1600, default 800), and writes a JPEG to
+`/tmp/slop/camera/` (a ring of the last 8, dir `0700`/files `0600`). The result
+carries a `content_ref` with a `file://` URI — the consumer runs on the same
+host and reads the file directly (sloppy registers it into its images
+provider); SLOP has no in-protocol content fetch, and the `/camera` node
+deliberately carries no ref of its own since ring pruning would leave it
+dangling. Capture follows the microphone's sleep policy: while `power_state` is
+`sleep` the invoke is rejected with `conflict` (asleep = deaf *and* blind).
+Requires [Pillow](https://pypi.org/project/pillow/); without it (or without a
+camera) `/camera.available` is `false` and `capture_frame` errors.
+
+For a live human-facing view (debugging from a browser/iPad), don't poll
+`capture_frame` — the daemon already streams WebRTC unconditionally; connect to
+its `webrtcsink` signalling server on `ws://<robot-host>:8443`.
+
 ## Setup
 
 Python ≥ 3.10. Using [`uv`](https://docs.astral.sh/uv/):
@@ -102,6 +123,10 @@ uv pip install "slop-ai>=0.2"
 # wake-word detection (optional — without it, wake-by-voice is disabled and
 # everything else still works; first run downloads the model)
 uv pip install "openwakeword>=0.6" onnxruntime
+
+# camera capture (optional — without it /camera reports available: false and
+# everything else still works)
+uv pip install pillow
 ```
 
 On **Linux with Python ≥ 3.12** (e.g. the Pi) that last install fails:
