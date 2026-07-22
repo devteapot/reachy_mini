@@ -1,4 +1,5 @@
 .slop/
+.bun/
 .sloppy/session-server.log
 .sloppy/sessions/
 Library/

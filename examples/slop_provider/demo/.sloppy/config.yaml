@@ -12,12 +12,9 @@
 #            → voice /tts → Voxtral 4B TTS via vLLM-Omni (spark :8091)
 #            → playback + runtime-driven head motion on the Reachy.
 #
-# NOTE: STT/TTS go through localhost forwarders (run_spark_proxy.sh → socat →
-# Spark). sloppy's voice policy only auto-starts the hands-free loop when both
-# speech endpoints are local, and in `session serve` mode nothing can drive the
-# remote-endpoint approval flow (the agent is blind to its own session
-# provider's /conversation node, and the TUI has no start_listening control).
-# The LLM endpoint is not part of the voice policy and stays direct.
+# NOTE: the Spark endpoints are non-localhost, so sloppy's voice network policy
+# asks for one approval in the TUI when the conversation loop starts listening
+# (createSpeechNetworkRule gates start_listening, then re-invokes preApproved).
 
 # LLM: Qwen3.6 brain on the Spark. The server defaults to non-thinking
 # (--default-chat-template-kwargs '{"enable_thinking": false}') and parses tool
@@ -25,6 +22,9 @@
 # The codex profile is kept as a manual fallback.
 llm:
   defaultProfileId: spark-brain
+  # Voice turns should stay short. The runtime's speech projection remains the
+  # final safety boundary, while this cap prevents long degenerate generations.
+  maxTokens: 512
   endpoints:
     spark:
       label: Spark Qwen3.6 brain
@@ -101,7 +101,7 @@ plugins:
         nemotron-spark:
           protocol: realtime-stt
           dialect: openai
-          baseUrl: ws://127.0.0.1:8002/v1/realtime # run_spark_proxy.sh → Spark
+          baseUrl: ws://192.168.1.103:8002/v1/realtime
           auth:
             type: none
           sampleRate: 16000
@@ -119,7 +119,7 @@ plugins:
         # Streams 24 kHz PCM from /v1/audio/speech.
         voxtral:
           protocol: openai-speech
-          baseUrl: http://127.0.0.1:8091/v1 # run_spark_proxy.sh → Spark
+          baseUrl: http://192.168.1.103:8091/v1
           auth:
             type: none
           model: mistralai/Voxtral-4B-TTS-2603
@@ -136,21 +136,23 @@ plugins:
   # router (gated by power_state/listen_mode — see audio_router.py): the
   # streamCommand bridges its Unix-socket PCM stream to stdout, and exits
   # non-zero on EOF so the continuous loop's restart backoff reconnects after a
-  # provider restart. Playback stays on the host (sox `play`); on the Pi set
-  # playStreamCommand: ["aplay", "-q", "-f", "S16_LE", "-r", "{rate}", "-c", "1"].
+  # provider restart. Playback stays on the host through PipeWire, whose default
+  # sink is the Reachy USB audio device; it resamples/upmixes the TTS PCM to the
+  # device's fixed 16 kHz stereo format.
   # Path is relative to demo/ (run_sloppy_demo.sh cd's there).
   voice-conversation:
     enabled: true
     audio:
       backend: host
       streamCommand: ["python3", "../audio_stream_client.py", "--socket", "/tmp/slop/reachy_audio.sock", "--rate", "{rate}"]
+      playStreamCommand: ["pw-cat", "--playback", "--raw", "--format", "s16", "--rate", "{rate}", "--channels", "1", "-"]
       streamChunkMs: 40
       providerId: reachy
     embodiment:
       enabled: true
       providerId: reachy
     realtime:
-      autoStartMode: continuous # hands-free from boot; localhost endpoints auto-start (no approval)
+      autoStartMode: continuous # hands-free from boot; Spark endpoints need one TUI approval
       defaultStartMode: continuous
 
 session:
